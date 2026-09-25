@@ -93,6 +93,7 @@ use Illuminate\Contracts\Routing\Registrar as Router;
 use Illuminate\Database\Connectors\ConnectionFactory;
 use Illuminate\Foundation\Console\AboutCommand;
 use Illuminate\Foundation\Events\Terminating;
+use Illuminate\Foundation\Exceptions\Handler as FrameworkHandler;
 use Illuminate\Foundation\Http\Events\RequestHandled;
 use Illuminate\Http\Client\Factory as HttpFactory;
 use Illuminate\Http\Client\PendingRequest;
@@ -1087,12 +1088,34 @@ class TelemetryServiceProvider extends ServiceProvider
      */
     private function registerExceptionReporting(): void
     {
+        $armed = new \WeakMap;
+
         $this->callAfterResolving(
             ExceptionHandler::class,
-            function (object $handler) {
-                if (! method_exists($handler, 'reportable')) {
+            function (object $handler) use ($armed): void {
+                // Collision's console provider rebinds the ExceptionHandler
+                // contract to an adapter that wraps the real handler after
+                // first resolving it, so this callback can fire twice per
+                // boot: once for the framework handler, once for the
+                // adapter (which delegates reportable() straight through
+                // to the wrapped instance). Registering on both would land
+                // two reportables on the same handler and every report()
+                // would emit two structured exception events.
+                //
+                // Two guards:
+                // - arm only on the framework Handler, not on adapters
+                //   (Collision's adapter is not a framework Handler, so
+                //   its delegated reportable() call never arms here);
+                // - and guard by handler object identity, so the same
+                //   instance resolved/rebound directly more than once is
+                //   still armed exactly once — the same shape as the Gate
+                //   instrumentation above.
+                if (! $handler instanceof FrameworkHandler
+                    || isset($armed[$handler])) {
                     return;
                 }
+
+                $armed[$handler] = true;
 
                 $app = $this->app;
 

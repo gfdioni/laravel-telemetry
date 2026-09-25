@@ -28,6 +28,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Laravel's reporting chain, other reportable callbacks and other Monolog
   handlers are untouched.
 
+- **Duplicate structured exception log under Laravel + Collision console
+  boot.** `CollisionServiceProvider` resolves the framework exception
+  handler and then REBINDS the `ExceptionHandler` contract to an adapter
+  wrapping that same instance. The container re-fires the package's
+  `afterResolving` callback for the adapter too, and Collision's adapter
+  delegates `reportable()` straight through to the wrapped handler — so
+  a single `report()` previously emitted two `ERROR exception` OTLP
+  records on every artisan boot (queue workers, scheduled commands, and
+  `tinker` included).
+
+  Exception-reportable arming is now idempotent per handler instance. The
+  callback arms only on the framework exception handler
+  (`Illuminate\Foundation\Exceptions\Handler`), not on adapters/proxies,
+  and a `WeakMap` identity guard prevents the same instance arming twice
+  when it is resolved/rebound directly — the same shape the package's own
+  Gate instrumentation already uses. **Compatibility:** custom non-framework
+  `ExceptionHandler` contract implementations that expose `reportable()`
+  but do not extend the framework `Handler` are no longer instrumented.
+  This was never documented or tested; framework extension is the
+  supported path.
+
 ## [2.7.2] - 2026-09-25
 
 ### Fixed
