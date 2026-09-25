@@ -59,6 +59,24 @@ supporting the events signal (`/v1/logs` on OTLP).
 Log records emitted *while a flush is exporting* are dropped — a failing
 exporter that reports through the logging stack can never feed itself.
 
+## Exception log deduplication
+
+`report()` runs the package's structured exception instrumentation **first**
+(emitting the `exception` OTLP log with `exception.file`/`.line`/
+`.stacktrace`/`.group`), then continues to Laravel's own default logger.
+When the `telemetry` channel rides in `LOG_STACK`, that default-logger pass
+would ship a second, less structured `ERROR <message>` record for the same
+throwable.
+
+The handler recognises that trailing pass — by **object identity** (a
+`WeakMap` mark set on the throwable by the exception instrumentation) and a
+message match against `$e->getMessage()` — and skips **only** it. The mark
+is consumed once, so a later explicit
+`Log::error('caught', ['exception' => $e])` from application code still
+ships. Object identity means two throwables that share class + message +
+stack stay independent, and `resetContext()` drops the mark between Octane
+requests and queue jobs so no state leaks across the boundary.
+
 ## Agent prompt
 
 ```text

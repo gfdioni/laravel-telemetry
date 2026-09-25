@@ -1152,6 +1152,17 @@ class TelemetryServiceProvider extends ServiceProvider
                             severityNumber: 17, // ERROR
                             severityText: 'ERROR',
                         ));
+
+                        // Laravel does not stop here: report() continues to
+                        // its own default logger, and when the telemetry
+                        // channel rides in LOG_STACK that pass would ship a
+                        // second, less structured OTLP log for the SAME
+                        // throwable. Mark it so TelemetryLogHandler can
+                        // recognise and skip its own duplicate — the only
+                        // consumer of that mark, which is dropped after one
+                        // skip so a later explicit Log::error(...,
+                        // ['exception' => $e]) still ships.
+                        $telemetry->markExceptionReported($e);
                     });
                 });
             },

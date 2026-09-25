@@ -49,6 +49,21 @@ final class TelemetryLogHandler extends AbstractProcessingHandler
         FailSafe::guard(function () use ($record) {
             $telemetry = ($this->resolveTelemetry)();
 
+            // Laravel's report() emits the structured `exception` record via
+            // the package's reportable callback, then continues to its own
+            // default logger — this handler — with the SAME throwable.
+            // That trailing pass is a duplicate OTLP log, not new
+            // information, so it is skipped. Explicit application logs that
+            // merely carry a throwable (`Log::error('caught',
+            // ['exception' => $e])`, never reported) never match the mark
+            // and pass through untouched.
+            $reported = $record->context['exception'] ?? null;
+
+            if ($reported instanceof \Throwable
+                && $telemetry->consumeReportedExceptionLog($reported, $record->message)) {
+                return;
+            }
+
             // Point LOG_DEPRECATIONS_CHANNEL=telemetry (or include the
             // telemetry channel in its stack) and deprecations become
             // countable — the pre-upgrade checklist as a metric.

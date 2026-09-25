@@ -224,6 +224,7 @@ class TelemetryManager
     {
         $this->tracer->resetContext();
         $this->rememberedUser = null;
+        $this->reportedExceptions = null;
     }
 
     /**
@@ -330,6 +331,30 @@ class TelemetryManager
     private ?WeakMap $failureContext = null;
 
     /**
+     * Throwables already emitted as a structured `exception` event by this
+     * manager's exception instrumentation.
+     *
+     * Laravel's report() runs the package's reportable callback (which emits
+     * the structured `exception` OTLP log) BEFORE it continues to its own
+     * default logger. When the telemetry channel rides in LOG_STACK that
+     * second, default-logger pass reaches TelemetryLogHandler and would
+     * otherwise ship a less structured `ERROR <message>` record for the
+     * SAME throwable — a duplicate OTLP log.
+     *
+     * Keyed by object identity, not by message/class/stack: two unrelated
+     * throwables that happen to share all three must stay independent, and
+     * a permanently suppressed throwable would also hide a legitimate later
+     * `Log::error('caught', ['exception' => $e])` that was never reported.
+     *
+     * The WeakMap holds no reference of its own, so an entry dies with the
+     * throwable it describes — no unbounded retention, no leak across the
+     * request/job boundary once resetContext() drops it.
+     *
+     * @var WeakMap<Throwable, true>|null
+     */
+    private ?WeakMap $reportedExceptions = null;
+
+    /**
      * Keep the current dimensions for whoever reports THIS throwable.
      *
      * A queue worker tears the job down before the exception reaches the
@@ -387,6 +412,46 @@ class TelemetryManager
         }
 
         return [];
+    }
+
+    /**
+     * Record that THIS throwable has already been emitted as a structured
+     * `exception` event, so the default-logger pass that follows report()
+     * can be recognised and skipped (see TelemetryLogHandler::write()).
+     *
+     * Called from the exception instrumentation's reportable callback, right
+     * after the structured event is buffered.
+     */
+    public function markExceptionReported(Throwable $e): void
+    {
+        $this->reportedExceptions ??= new WeakMap;
+
+        $this->reportedExceptions[$e] = true;
+    }
+
+    /**
+     * Is this Monolog record Laravel's own default-logger pass for a
+     * throwable the package already emitted a structured `exception` event
+     * for? Consume the mark: only the immediate trailing log is a duplicate,
+     * and a later explicit `Log::error($e->getMessage(), ['exception' => $e])`
+     * from application code must still ship.
+     *
+     * The message must match the throwable's own message because that is
+     * exactly what Laravel logs (`$logger->error($e->getMessage(), [...,
+     * 'exception' => $e])`) — an explicit application log that merely
+     * carries the same throwable says something else and passes through.
+     */
+    public function consumeReportedExceptionLog(Throwable $e, string $message): bool
+    {
+        if ($this->reportedExceptions === null
+            || ! isset($this->reportedExceptions[$e])
+            || $message !== $e->getMessage()) {
+            return false;
+        }
+
+        unset($this->reportedExceptions[$e]);
+
+        return true;
     }
 
     /**

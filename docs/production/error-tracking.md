@@ -108,6 +108,12 @@ is sampled away. This is the raw data an issues UI groups by
 the trace). The counter stays class-scoped for bounded rate/alerting;
 the fingerprint lives on the record, never as a metric label.
 
+One `report()` produces exactly **one** of these records. Laravel's own
+trailing default-logger pass for the same throwable is skipped by the
+telemetry log channel (identity-based, one-shot — see
+[logs: exception log deduplication](../core-concepts/logs.md#exception-log-deduplication)),
+so wiring the channel into `LOG_STACK` does not double-report.
+
 > Backend error tracking without a separate error-tracker: query the
 > exception records in Loki, or group them in
 > [`cboxdk/laravel-telemetry-ui`](https://github.com/cboxdk/laravel-telemetry).

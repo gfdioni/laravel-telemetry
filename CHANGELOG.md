@@ -5,6 +5,29 @@ All notable changes to `cboxdk/laravel-telemetry` will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+
+## [Unreleased]
+
+### Fixed
+
+- **Duplicate OTLP log for a reported exception.** `report()` runs the
+  package's structured exception instrumentation first (the `exception`
+  OTLP log with `exception.file`/`.line`/`.stacktrace`/`.group`), then
+  continues to Laravel's own default logger — and when the `telemetry`
+  channel rides in `LOG_STACK`, that trailing pass shipped a second, less
+  structured `ERROR <message>` record for the same throwable.
+
+  The telemetry log channel now recognises that trailing pass and skips
+  only it. Identity is the throwable object itself (a one-shot `WeakMap`
+  mark set by the exception instrumentation) plus a message match against
+  `$e->getMessage()` — exactly the shape of Laravel's default-logger call —
+  so two exceptions that share class + message + stack stay independent,
+  and an explicit `Log::error('caught', ['exception' => $e])` that was
+  never `report()`ed still ships. The mark is consumed by the skip and
+  dropped by `resetContext()` between Octane requests and queue jobs.
+  Laravel's reporting chain, other reportable callbacks and other Monolog
+  handlers are untouched.
+
 ## [2.7.2] - 2026-09-25
 
 ### Fixed
