@@ -151,6 +151,15 @@ it('emits one structured event for a queue failure through the Collision lifecyc
     $job->shouldReceive('getQueue')->andReturn('default');
     $job->shouldReceive('attempts')->andReturn(1);
     $job->shouldReceive('payload')->andReturn([]);
+    // v3's queue instrumentation also reads identity and outcome flags off
+    // the job when closing the attempt (uuid for retry links, isReleased /
+    // isDeleted / hasFailed for the outcome). A strict mock without these
+    // throws inside the listener, and those Mockery errors surface as
+    // reported exceptions — triple-counting this scenario.
+    $job->shouldReceive('uuid')->andReturn('test-job-uuid');
+    $job->shouldReceive('isReleased')->andReturnFalse();
+    $job->shouldReceive('isDeleted')->andReturnFalse();
+    $job->shouldReceive('hasFailed')->andReturnTrue();
 
     $events = app('events');
     $events->dispatch(new JobProcessing('redis', $job));
