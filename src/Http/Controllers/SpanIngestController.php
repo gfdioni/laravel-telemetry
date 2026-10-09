@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Cbox\Telemetry\Http\Controllers;
 
+use Cbox\Telemetry\Contracts\RedactsTelemetry;
 use Cbox\Telemetry\Events\TelemetryEvent;
 use Cbox\Telemetry\Support\CampaignAttribution;
 use Cbox\Telemetry\Support\ClientGeo;
@@ -71,62 +72,72 @@ final class SpanIngestController
         // then stamped on every browser span and event below.
         $enrichment = FailSafe::guard(fn (): array => self::enrichment($request, $telemetry)) ?? [];
 
-        FailSafe::guard(function () use ($request, $config, $enrichment) {
-            $input = $request->json('spans');
+        self::$redactor = FailSafe::guard(fn (): ?RedactsTelemetry => app()->bound(RedactsTelemetry::class)
+            ? app(RedactsTelemetry::class)
+            : null);
 
-            if (! is_array($input)) {
-                return;
-            }
+        try {
 
-            $maxSpans = (int) ($config['max_spans'] ?? 128);
-            $maxAttrs = (int) ($config['max_attributes'] ?? 32);
-            $now = (int) (microtime(true) * 1e9);
+            FailSafe::guard(function () use ($request, $config, $enrichment) {
+                $input = $request->json('spans');
 
-            $spans = [];
-
-            foreach (array_slice($input, 0, $maxSpans) as $raw) {
-                $span = self::build(is_array($raw) ? $raw : [], $maxAttrs, $now, $enrichment);
-
-                if ($span !== null) {
-                    $spans[] = $span;
+                if (! is_array($input)) {
+                    return;
                 }
-            }
 
-            if ($spans !== []) {
-                $request->attributes->set(self::PENDING_SPANS, $spans);
-            }
-        });
+                $maxSpans = (int) ($config['max_spans'] ?? 128);
+                $maxAttrs = (int) ($config['max_attributes'] ?? 32);
+                $now = (int) (microtime(true) * 1e9);
 
-        // Analytics events (SPA page views, engagement, custom track()) —
-        // re-emitted as unsampled OTLP log records so they are never
-        // undercounted, on the same event stream as the server's page views.
-        FailSafe::guard(function () use ($request, $config, $enrichment) {
-            $input = $request->json('events');
+                $spans = [];
 
-            if (! is_array($input)) {
-                return;
-            }
+                foreach (array_slice($input, 0, $maxSpans) as $raw) {
+                    $span = self::build(is_array($raw) ? $raw : [], $maxAttrs, $now, $enrichment);
 
-            $max = (int) ($config['max_spans'] ?? 128);
-            $maxAttrs = (int) ($config['max_attributes'] ?? 32);
-            $now = (int) (microtime(true) * 1e9);
-
-            $events = [];
-
-            foreach (array_slice($input, 0, $max) as $raw) {
-                $event = self::buildEvent(is_array($raw) ? $raw : [], $maxAttrs, $now, $enrichment);
-
-                if ($event !== null) {
-                    $events[] = $event;
+                    if ($span !== null) {
+                        $spans[] = $span;
+                    }
                 }
-            }
 
-            if ($events !== []) {
-                $request->attributes->set(self::PENDING_EVENTS, $events);
-            }
-        });
+                if ($spans !== []) {
+                    $request->attributes->set(self::PENDING_SPANS, $spans);
+                }
+            });
 
-        return new Response('', 204);
+            // Analytics events (SPA page views, engagement, custom track()) —
+            // re-emitted as unsampled OTLP log records so they are never
+            // undercounted, on the same event stream as the server's page views.
+            FailSafe::guard(function () use ($request, $config, $enrichment) {
+                $input = $request->json('events');
+
+                if (! is_array($input)) {
+                    return;
+                }
+
+                $max = (int) ($config['max_spans'] ?? 128);
+                $maxAttrs = (int) ($config['max_attributes'] ?? 32);
+                $now = (int) (microtime(true) * 1e9);
+
+                $events = [];
+
+                foreach (array_slice($input, 0, $max) as $raw) {
+                    $event = self::buildEvent(is_array($raw) ? $raw : [], $maxAttrs, $now, $enrichment);
+
+                    if ($event !== null) {
+                        $events[] = $event;
+                    }
+                }
+
+                if ($events !== []) {
+                    $request->attributes->set(self::PENDING_EVENTS, $events);
+                }
+            });
+
+            return new Response('', 204);
+        } finally {
+            // The redactor belongs to this request and nothing later.
+            self::$redactor = null;
+        }
     }
 
     /**
@@ -194,7 +205,7 @@ final class SpanIngestController
         $attributes = [...$attributes, ...$enrichment];
 
         if (($session = self::str($raw['sessionId'] ?? null)) !== null) {
-            $attributes['session.id'] = mb_substr($session, 0, self::MAX_VALUE);
+            $attributes['session.id'] = mb_substr(self::redact('session.id', $session), 0, self::MAX_VALUE);
         }
 
         $traceId = self::str($raw['traceId'] ?? null);
@@ -251,7 +262,10 @@ final class SpanIngestController
             traceId: $traceId,
             spanId: $spanId,
             parentSpanId: $parent,
-            name: mb_substr($name, 0, self::MAX_NAME),
+            // A span NAME is free text from the browser, and it is cut
+            // like everything else here — so it is redacted first, like
+            // everything else here.
+            name: mb_substr(self::redact('span.name', $name), 0, self::MAX_NAME),
             kind: self::kind(self::str($raw['kind'] ?? null)),
             sampled: true,
             attributes: $attributes,
@@ -269,6 +283,28 @@ final class SpanIngestController
     }
 
     /**
+     * The configured redactor, resolved once per process.
+     *
+     * Null only when the host has not bound one, which means redaction
+     * is off entirely — and then there is nothing for the cut below to
+     * destroy.
+     */
+    private static ?RedactsTelemetry $redactor = null;
+
+    /**
+     * Resolved once per REQUEST, not once per process.
+     *
+     * A static that outlives the request keeps whichever redactor was
+     * bound the first time — including the disabled one a boot-order
+     * accident produced, or a test's — and a stale redactor permits
+     * the cut below without scrubbing anything.
+     */
+    private static function redact(string $key, string $value): string
+    {
+        return self::$redactor?->value($key, $value) ?? $value;
+    }
+
+    /**
      * @param  array<mixed>  $raw
      * @return array<string, scalar>
      */
@@ -282,7 +318,14 @@ final class SpanIngestController
             }
 
             if (is_string($value)) {
-                $out[mb_substr($key, 0, self::MAX_NAME)] = mb_substr($value, 0, self::MAX_VALUE);
+                // Redacted BEFORE it is cut. This is untrusted input,
+                // so the cut has to stay — but cutting first is how a
+                // credential survives it: a thousand characters of
+                // padding and then `https://alice:hunter2@example.test/`
+                // loses its `@` at the boundary, and what is left is a
+                // string the userinfo pattern no longer recognises. One
+                // pass per ingested batch; this is not a hot path.
+                $out[mb_substr($key, 0, self::MAX_NAME)] = mb_substr(self::redact($key, $value), 0, self::MAX_VALUE);
             } elseif (is_int($value) || is_float($value) || is_bool($value)) {
                 $out[mb_substr($key, 0, self::MAX_NAME)] = $value;
             }

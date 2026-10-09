@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Cbox\Telemetry\Metrics\Stores;
 
 use Cbox\Telemetry\Contracts\MetricStore;
+use Cbox\Telemetry\Contracts\ReportsOverflow;
 use Cbox\Telemetry\Metrics\Exemplar;
 use Cbox\Telemetry\Metrics\HistogramSample;
 use Cbox\Telemetry\Metrics\Labels;
@@ -12,8 +13,11 @@ use Cbox\Telemetry\Metrics\MetricDefinition;
 use Cbox\Telemetry\Metrics\MetricFamily;
 use Cbox\Telemetry\Metrics\MetricType;
 use Cbox\Telemetry\Metrics\Sample;
+use Cbox\Telemetry\Support\SharedState;
 use Illuminate\Contracts\Redis\Factory;
 use Illuminate\Redis\Connections\Connection;
+use Illuminate\Redis\Connections\PhpRedisConnection;
+use Throwable;
 
 /**
  * The default shared store: one Redis HASH per metric family, one index SET
@@ -34,15 +38,61 @@ use Illuminate\Redis\Connections\Connection;
  *
  * Collect is SMEMBERS + HGETALL per family — never KEYS or SCAN.
  */
-final class RedisMetricStore implements MetricStore
+final class RedisMetricStore implements MetricStore, ReportsOverflow
 {
-    /** @var array<string, int> unix time of the last successful initialization, per metric */
-    private array $initialized = [];
+    /**
+     * Applies a flat list of (op, field, value) triples to one hash.
+     * `i` HINCRBY, `f` HINCRBYFLOAT, `s` HSET.
+     */
+    private const APPLY_SCRIPT = <<<'LUA'
+        local limit = tonumber(ARGV[1])
+        local i = 2
+
+        -- The budget is decided for the WHOLE observation, never per
+        -- field. A histogram writes a bucket, a sum and a count; if the
+        -- bucket is refused and the other two are not, the series ends
+        -- up with a count of 2 and buckets adding to 1, which is not a
+        -- number anyone can read. Either all of it lands or none of it
+        -- does, and the refusal is counted once.
+        if limit > 0 then
+            local needed = 0
+            while i <= #ARGV do
+                if redis.call('HEXISTS', KEYS[1], ARGV[i + 1]) == 0 then
+                    needed = needed + 1
+                end
+                i = i + 3
+            end
+
+            if needed > 0 and redis.call('HLEN', KEYS[1]) + needed > limit then
+                redis.call('HINCRBY', KEYS[1], '__overflow', 1)
+                return 1
+            end
+        end
+
+        i = 2
+        while i <= #ARGV do
+            local op = ARGV[i]
+            if op == 'i' then
+                redis.call('HINCRBY', KEYS[1], ARGV[i + 1], ARGV[i + 2])
+            elseif op == 'f' then
+                redis.call('HINCRBYFLOAT', KEYS[1], ARGV[i + 1], ARGV[i + 2])
+            else
+                redis.call('HSET', KEYS[1], ARGV[i + 1], ARGV[i + 2])
+            end
+            i = i + 3
+        end
+
+        return 0
+        LUA;
+
+    /** How long a server that refused EVAL is left alone before we ask again. */
+    private const RETRY_SCRIPTING_AFTER_SECONDS = 300;
 
     public function __construct(
         private readonly Factory $redis,
         private readonly string $connection = 'default',
         private readonly string $prefix = 'telemetry',
+        private readonly int $maxFields = 50_000,
     ) {}
 
     public function incrementCounter(MetricDefinition $definition, array $labels, float $by): void
@@ -50,68 +100,201 @@ final class RedisMetricStore implements MetricStore
         $key = $this->familyKey(MetricType::Counter, $definition->name);
 
         $this->initialize($definition, $key);
-        $this->connection()->hincrbyfloat($key, Labels::encode($labels), $by);
+        $this->apply($key, [['f', Labels::encode($labels), (string) $by]]);
     }
 
     public function setGauge(MetricDefinition $definition, array $labels, float $value): void
     {
-        $key = $this->familyKey(MetricType::Gauge, $definition->name);
+        // The DEFINITION's type, not a hardcoded Gauge. A push instrument
+        // whose value is read whole rather than accumulated may still be
+        // declared an up-down counter or a counter — a daemon reading a
+        // host's memory writes an absolute number, and what that number
+        // IS does not change because of how it reached the store. Keying
+        // by the declared type is what lets it come back out as one.
+        $key = $this->familyKey($this->scalarType($definition), $definition->name);
 
         $this->initialize($definition, $key);
-        $this->connection()->hset($key, Labels::encode($labels), (string) $value);
+        $this->apply($key, [['s', Labels::encode($labels), (string) $value]]);
     }
 
     public function addGauge(MetricDefinition $definition, array $labels, float $delta): void
     {
-        $key = $this->familyKey(MetricType::Gauge, $definition->name);
+        $key = $this->familyKey($this->scalarType($definition), $definition->name);
 
         $this->initialize($definition, $key);
-        $this->connection()->hincrbyfloat($key, Labels::encode($labels), $delta);
+        $this->apply($key, [['f', Labels::encode($labels), (string) $delta]]);
     }
 
     public function recordHistogram(MetricDefinition $definition, array $labels, float $value, ?Exemplar $exemplar = null): void
     {
+        // Belt and braces with Histogram::record(): Redis refuses to
+        // increment a sum by NAN or INF, which fails the script after
+        // the bucket has been counted.
+        if (! is_finite($value)) {
+            return;
+        }
+
         $key = $this->familyKey(MetricType::Histogram, $definition->name);
         $series = base64_encode(Labels::encode($labels));
         $bucket = $this->bucketIndex($definition->buckets ?? [], $value);
 
         $this->initialize($definition, $key);
 
-        $connection = $this->connection();
-        $connection->hincrby($key, "{$series}:b{$bucket}", 1);
-        $connection->hincrbyfloat($key, "{$series}:sum", $value);
-        $connection->hincrby($key, "{$series}:count", 1);
+        $operations = [
+            ['i', "{$series}:b{$bucket}", '1'],
+            ['f', "{$series}:sum", (string) $value],
+            ['i', "{$series}:count", '1'],
+        ];
 
         if ($exemplar !== null) {
-            $connection->hset($key, "{$series}:exemplar", $this->encodeExemplar($exemplar));
+            $operations[] = ['s', "{$series}:exemplar", $this->encodeExemplar($exemplar)];
         }
+
+        $this->apply($key, $operations);
     }
 
     public function mergeHistogram(MetricDefinition $definition, array $labels, array $bucketCounts, float $sum, int $count, ?Exemplar $exemplar = null): void
     {
+        // A sum can reach infinity from observations that were each
+        // perfectly finite — two of PHP_FLOAT_MAX is all it takes, and
+        // the write buffer adds them up before anything here sees
+        // them. Redis then refuses the sum after the buckets have
+        // already been counted.
+        if (! is_finite($sum)) {
+            return;
+        }
+
         $key = $this->familyKey(MetricType::Histogram, $definition->name);
         $series = base64_encode(Labels::encode($labels));
 
         $this->initialize($definition, $key);
 
-        $connection = $this->connection();
+        $operations = [];
 
         foreach ($bucketCounts as $index => $bucketCount) {
             if ($bucketCount > 0) {
-                $connection->hincrby($key, "{$series}:b{$index}", $bucketCount);
+                $operations[] = ['i', "{$series}:b{$index}", (string) $bucketCount];
             }
         }
 
         if ($sum !== 0.0) {
-            $connection->hincrbyfloat($key, "{$series}:sum", $sum);
+            $operations[] = ['f', "{$series}:sum", (string) $sum];
         }
 
         if ($count > 0) {
-            $connection->hincrby($key, "{$series}:count", $count);
+            $operations[] = ['i', "{$series}:count", (string) $count];
         }
 
         if ($exemplar !== null) {
-            $connection->hset($key, "{$series}:exemplar", $this->encodeExemplar($exemplar));
+            $operations[] = ['s', "{$series}:exemplar", $this->encodeExemplar($exemplar)];
+        }
+
+        $this->apply($key, $operations);
+    }
+
+    /**
+     * Apply several field writes to ONE hash, atomically and in one
+     * round trip.
+     *
+     * A histogram observation is three writes — bucket, sum, count —
+     * and they were three commands. Two consequences, both of which
+     * showed up in review. The cost: three synchronous round trips per
+     * observation, so a request touching three histogram families paid
+     * nine before anything else. And the correctness: a failure between
+     * them leaves a series whose buckets add up to more than its count,
+     * which is not a number anyone can reason about afterwards — a
+     * retry after a partial write produced exactly that.
+     *
+     * Every field is in the same key, so the script is single-key and
+     * valid on Redis Cluster. A server that refuses EVAL falls back to
+     * the individual commands, once, and is remembered: an atomicity
+     * improvement must not be able to stop metrics being written at
+     * all.
+     *
+     * The script also enforces the per-family field budget, which is
+     * the only place a budget can be enforced correctly: the series
+     * already stored live in Redis, so no process can know the count
+     * on its own, and under PHP-FPM a per-process tally is a
+     * per-request one. Inside the script HEXISTS and HLEN are local
+     * calls — the budget costs nothing on the wire. Refused writes are
+     * counted into a `__overflow` field on the family, because a
+     * cardinality ceiling nobody is told about is just missing data.
+     *
+     * @param  list<array{0: 'i'|'f'|'s', 1: string, 2: string}>  $operations
+     */
+    private function apply(string $key, array $operations): void
+    {
+        if ($operations === []) {
+            return;
+        }
+
+        $connection = $this->connection();
+
+        if (! $this->scriptingIsRefused()) {
+            $arguments = [(string) $this->maxFields];
+
+            foreach ($operations as [$op, $field, $value]) {
+                $arguments[] = $op;
+                $arguments[] = $field;
+                $arguments[] = $value;
+            }
+
+            try {
+                // The two clients disagree on how EVAL is called.
+                // phpredis takes (script, args, numKeys) and Laravel's
+                // PhpRedisConnection::eval() reorders for it; predis
+                // takes (script, numKeys, ...args) natively. Spelling
+                // both out is shorter than the wrapper that would hide
+                // it, and says which is which.
+                $result = $connection instanceof PhpRedisConnection
+                    ? $connection->eval(self::APPLY_SCRIPT, 1, $key, ...$arguments)
+                    : $connection->command('eval', [self::APPLY_SCRIPT, 1, $key, ...$arguments]);
+
+                // phpredis answers a refused command with false rather
+                // than an exception, and the script itself always
+                // returns an integer. Taking false for success meant a
+                // server with scripting disabled silently discarded
+                // every metric write, forever.
+                // phpredis answers BOTH a refused command and a Lua
+                // runtime error with false, so false alone does not
+                // say which. A one-line probe does, and asking is the
+                // only way to avoid the two wrong answers: repeating
+                // the operations after a script that actually ran
+                // double-counts, and latching off scripting for a
+                // transient error throws away atomicity and the
+                // series budget with it.
+                if ($result === false) {
+                    if (! $this->scriptingIsRefusedByProbe($connection, $key)) {
+                        return;
+                    }
+
+                    SharedState::remember($this->scriptingKey(), time() + self::RETRY_SCRIPTING_AFTER_SECONDS);
+                } else {
+                    return;
+                }
+            } catch (Throwable $e) {
+                // Only a server that cannot run EVAL justifies the
+                // non-atomic path. A timeout does not: the script may
+                // have executed and lost its reply, so repeating the
+                // operations would count the observation twice — and
+                // one lost observation is cheaper than a wrong one.
+                if (! self::scriptingIsUnsupported($e)) {
+                    return;
+                }
+
+                // Remembered with an expiry, not latched for the life
+                // of the process: a transient answer must not disable
+                // atomicity and the series budget permanently.
+                SharedState::remember($this->scriptingKey(), time() + self::RETRY_SCRIPTING_AFTER_SECONDS);
+            }
+        }
+
+        foreach ($operations as [$op, $field, $value]) {
+            match ($op) {
+                'i' => $connection->command('hincrby', [$key, $field, (int) $value]),
+                'f' => $connection->command('hincrbyfloat', [$key, $field, (float) $value]),
+                's' => $connection->command('hset', [$key, $field, $value]),
+            };
         }
     }
 
@@ -154,7 +337,21 @@ final class RedisMetricStore implements MetricStore
 
     private function initialize(MetricDefinition $definition, string $key): void
     {
-        $memo = $definition->type->value.':'.$definition->name;
+        // Held in shared memory where there is any. A per-process memo
+        // is no memo at all under PHP-FPM, where the process state is
+        // the request's: every request rewrote the bookkeeping for
+        // every metric it touched, three commands each, and with ten
+        // families that is thirty round trips a request for data that
+        // changes on deploy.
+        // Keyed by the connection AND the definition's shape, not just
+        // its name. Two connections share a process; the same metric on
+        // connection B would otherwise skip its own bookkeeping because
+        // A had written its, and stay invisible to collection for five
+        // minutes. A deploy that changes a histogram's bounds is the
+        // same problem in time rather than space.
+        $memo = 'store:init:'.$this->prefix.':'.$this->connection.':'
+            .$definition->type->value.':'.$definition->name.':'
+            .substr(hash('xxh128', $this->encodeMeta($definition)), 0, 12);
         $now = time();
 
         // Re-run periodically rather than once per process. The bookkeeping
@@ -165,7 +362,7 @@ final class RedisMetricStore implements MetricStore
         // index and drops any family whose __meta is missing, so the metric
         // vanished from every scrape until a COLD process happened to write
         // it again — which, for a series with one long-lived writer, is never.
-        if (($this->initialized[$memo] ?? 0) > $now - self::REINITIALIZE_AFTER_SECONDS) {
+        if ($now < SharedState::deadline($memo)) {
             return;
         }
 
@@ -177,14 +374,95 @@ final class RedisMetricStore implements MetricStore
         // Memoize only once the writes landed. Setting it first meant a single
         // transient failure disabled initialization for the life of the
         // process, permanently.
-        $this->initialized[$memo] = $now;
+        SharedState::remember($memo, $now + self::REINITIALIZE_AFTER_SECONDS);
+    }
+
+    private function scriptingKey(): string
+    {
+        return 'store:noscript:'.$this->prefix.':'.$this->connection;
+    }
+
+    /**
+     * Ask the server whether it runs scripts at all.
+     *
+     * One trivial EVAL. If that works, the failure above was the
+     * script's own — a NaN increment, a wrong type — and the fallback
+     * would repeat work that already happened.
+     */
+    private function scriptingIsRefusedByProbe(Connection $connection, string $key): bool
+    {
+        try {
+            // One key, like the real script. A managed Redis can
+            // refuse a zero-key EVAL while running keyed ones
+            // perfectly well — ElastiCache documents exactly that —
+            // and a probe that does not look like the thing it is
+            // probing for answers the wrong question.
+            $probe = $connection instanceof PhpRedisConnection
+                ? $connection->eval('return 1', 1, $key)
+                : $connection->command('eval', ['return 1', 1, $key]);
+
+            return $probe === false;
+        } catch (Throwable $e) {
+            return self::scriptingIsUnsupported($e);
+        }
+    }
+
+    private function scriptingIsRefused(): bool
+    {
+        return time() < SharedState::deadline($this->scriptingKey());
+    }
+
+    /**
+     * Whether this failure says the SERVER will not run scripts, as
+     * opposed to saying nothing useful about whether it ran this one.
+     */
+    private static function scriptingIsUnsupported(Throwable $e): bool
+    {
+        $message = strtolower($e->getMessage());
+
+        // An ACL failure INSIDE the script is not a refused EVAL: the
+        // script ran, some of its commands landed, and repeating them
+        // non-atomically double-counts what already happened. Redis
+        // says which by prefixing the in-script form.
+        if (str_contains($message, 'in script') || str_contains($message, 'called from script')) {
+            return false;
+        }
+
+        foreach (['unknown command', 'not allowed', 'unsupported', 'disabled', 'noperm', 'no permissions'] as $needle) {
+            if (str_contains($message, $needle)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * @return array<string, int>
+     */
+    public function overflowingFamilies(): array
+    {
+        $overflowing = [];
+        $connection = $this->connection();
+
+        foreach (MetricType::cases() as $type) {
+            foreach ($this->names($type) as $name) {
+                $refused = $connection->hget($this->familyKey($type, $name), '__overflow');
+
+                if (is_string($refused) && (int) $refused > 0) {
+                    $overflowing[$name] = (int) $refused;
+                }
+            }
+        }
+
+        return $overflowing;
     }
 
     public function collect(): array
     {
         $families = [];
 
-        foreach ([MetricType::Counter, MetricType::Gauge] as $type) {
+        foreach ([MetricType::Counter, MetricType::UpDownCounter, MetricType::Gauge] as $type) {
             foreach ($this->names($type) as $name) {
                 $family = $this->collectScalarFamily($type, $name);
 
@@ -387,6 +665,16 @@ final class RedisMetricStore implements MetricStore
     private function connection(): Connection
     {
         return $this->redis->connection($this->connection);
+    }
+
+    /**
+     * The storage namespace for a scalar push write. Histogram
+     * definitions never reach the gauge writers, but a wrong definition
+     * must not land histogram data in a scalar family.
+     */
+    private function scalarType(MetricDefinition $definition): MetricType
+    {
+        return $definition->type === MetricType::Histogram ? MetricType::Gauge : $definition->type;
     }
 
     private function familyKey(MetricType $type, string $name): string

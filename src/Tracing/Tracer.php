@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Cbox\Telemetry\Tracing;
 
+use Cbox\Telemetry\Support\FailSafe;
 use Cbox\Telemetry\Support\Ids;
 use Cbox\Telemetry\Support\TraceParent;
 use Closure;
@@ -33,6 +34,12 @@ final class Tracer
 
     private ?Closure $onBufferFull = null;
 
+    /** Spans refused because the buffer was full and would not drain. */
+    private int $dropped = 0;
+
+    /** Approximate bytes held by the finished-span buffer. */
+    private int $bufferedBytes = 0;
+
     /** @var array<string, scalar> ambient dimensions merged into every finished span; a null passed to addContext() removes the key rather than storing one */
     private array $contextAttributes = [];
 
@@ -57,6 +64,10 @@ final class Tracer
         private readonly float $sampleRate = 1.0,
         private readonly int $maxBuffer = 5000,
         private readonly bool $alwaysSampleErrors = true,
+        // Appended, not inserted: `new Tracer(1.0, 5000, false)` is a
+        // call an application can have written, and slipping an int
+        // into third position turns it into a TypeError on upgrade.
+        private readonly int $maxBufferBytes = 33_554_432,
     ) {}
 
     /**
@@ -219,6 +230,25 @@ final class Tracer
     }
 
     /**
+     * Join a remote trace by its id alone, with no parent: the next span
+     * starts as the root of this process's part of the trace.
+     *
+     * For a parent span id that names no span anyone will export — a load
+     * balancer that injects traceparent so its access log joins the
+     * backend's trace, but traces nothing itself. Continuing from it makes
+     * every request the child of a span that never arrives, and trace
+     * backends list those traces as missing their root. The trace id still
+     * joins the two; the caller links the remote span instead of parenting
+     * it (SpanLink) so the reference is kept without claiming an ancestor.
+     */
+    public function adoptTraceId(TraceParent $parent, bool $trustSampling = true): void
+    {
+        $this->remoteParent = null;
+        $this->traceId = $parent->traceId;
+        $this->sampled = $trustSampling ? $parent->sampled : null;
+    }
+
+    /**
      * @param  array<string, scalar|null>  $attributes
      * @param  list<SpanLink>  $links  Causal references to related but
      *                                 non-ancestor spans (e.g. a retried
@@ -344,9 +374,15 @@ final class Tracer
      * reporting its own duration). The span is backdated and closed
      * immediately, parented to the current span.
      *
+     * `$status` is a parameter rather than something the caller sets on
+     * the returned span, because by then it is too late: this ends the
+     * span, ending flushes it, and a full buffer exports it before the
+     * caller gets it back. A failure recorded that way arrives with its
+     * error attributes and no error status.
+     *
      * @param  array<string, scalar|null>  $attributes
      */
-    public function recordSpan(string $name, float $durationMs, array $attributes = [], SpanKind $kind = SpanKind::Internal, bool $detail = false): Span
+    public function recordSpan(string $name, float $durationMs, array $attributes = [], SpanKind $kind = SpanKind::Internal, bool $detail = false, ?SpanStatus $status = null, ?string $statusDescription = null): Span
     {
         $durationNano = (int) ($durationMs * 1_000_000);
         $start = (int) (microtime(true) * 1e9) - $durationNano;
@@ -371,6 +407,10 @@ final class Tracer
 
         if ($detail) {
             $span->markDetail();
+        }
+
+        if ($status !== null) {
+            $span->setStatus($status, $statusDescription);
         }
 
         $span->end($start + $durationNano);
@@ -464,6 +504,7 @@ final class Tracer
     {
         $spans = $this->finished;
         $this->finished = [];
+        $this->bufferedBytes = 0;
 
         return $spans;
     }
@@ -471,6 +512,28 @@ final class Tracer
     public function bufferedCount(): int
     {
         return count($this->finished);
+    }
+
+    /**
+     * Spans this tracer refused because the buffer was full and could
+     * not be drained — surfaced as telemetry.spans.dropped, because a
+     * gap in a trace that nothing reports is a lie.
+     */
+    public function droppedSpans(): int
+    {
+        return $this->dropped;
+    }
+
+    /**
+     * Read the drop count and reset it — the manager turns it into a
+     * counter on each flush.
+     */
+    public function takeDroppedSpans(): int
+    {
+        $dropped = $this->dropped;
+        $this->dropped = 0;
+
+        return $dropped;
     }
 
     /**
@@ -581,11 +644,40 @@ final class Tracer
             $this->traceStats = [];
         }
 
-        $this->finished[] = $span;
+        $bytes = $span->approximateBytes();
 
-        if (count($this->finished) >= $this->maxBuffer && $this->onBufferFull !== null) {
-            ($this->onBufferFull)();
+        // Count AND bytes. Five thousand spans is a sensible ceiling for
+        // ordinary spans and no ceiling at all for a span carrying a
+        // 100KB query, a serialized payload or a stack — and a limit on
+        // the value's length instead would cut a credential in half
+        // before redaction could see it.
+        if (count($this->finished) >= $this->maxBuffer
+            || ($this->maxBufferBytes > 0 && $this->bufferedBytes + $bytes > $this->maxBufferBytes)) {
+            if ($this->onBufferFull !== null) {
+                // Guarded: the callback is a flush, which reaches the
+                // exporters, the store and the network. It runs from
+                // inside `end()`, on the application's stack, and
+                // nothing above it catches.
+                $flush = $this->onBufferFull;
+                FailSafe::guard(static fn () => $flush());
+            }
+
+            // The drain is a request, not a guarantee: the callback may
+            // be absent (a tracer used directly), or the flush may have
+            // been declined — the circuit is open, the exporter is
+            // failing. Buffering anyway is how an observability library
+            // becomes the reason a worker is OOM-killed, so the span is
+            // dropped and counted instead.
+            if (count($this->finished) >= $this->maxBuffer
+                || ($this->maxBufferBytes > 0 && $this->bufferedBytes + $bytes > $this->maxBufferBytes)) {
+                $this->dropped++;
+
+                return;
+            }
         }
+
+        $this->finished[] = $span;
+        $this->bufferedBytes += $bytes;
     }
 
     private function lottery(): bool

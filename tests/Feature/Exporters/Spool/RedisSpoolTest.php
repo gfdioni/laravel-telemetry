@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 use Cbox\Telemetry\Exporters\Spool\RedisSpool;
 use Illuminate\Contracts\Redis\Factory;
+use Illuminate\Redis\Connections\Connection;
+use Illuminate\Redis\Events\CommandExecuted;
+use Illuminate\Support\Facades\Event;
 
 uses()->group('redis');
 
@@ -100,4 +103,173 @@ it('stops popping at an empty list', function () {
 
     expect($this->spool->pop(100))->toHaveCount(1)
         ->and($this->spool->pop(100))->toBe([]);
+});
+
+it('costs two commands for a request that spools both signals', function () {
+    // This runs on the response's clock. Two pushes of one entry each,
+    // with a trim after each, was four synchronous round trips per
+    // request — and the docs said "one RPUSH".
+    $commands = [];
+    app(Factory::class)->enableEvents();
+    Event::listen(CommandExecuted::class, function (CommandExecuted $event) use (&$commands): void {
+        $commands[] = $event->command;
+    });
+
+    $this->spool->pushMany([spoolEntry('spans'), spoolEntry('events')]);
+
+    expect($commands)->toBe(['rpush', 'ltrim'])
+        ->and($this->spool->size())->toBe(2);
+});
+
+it('takes a whole batch off the list in one command', function () {
+    // Two hundred LPOPs was two hundred round trips, and the drain
+    // paid them again for the empty tail of every pass.
+    foreach (range(1, 3) as $i) {
+        $this->spool->push(spoolEntry("e{$i}"));
+    }
+
+    $commands = [];
+    app(Factory::class)->enableEvents();
+    Event::listen(CommandExecuted::class, function (CommandExecuted $event) use (&$commands): void {
+        $commands[] = $event->command;
+    });
+
+    $entries = $this->spool->pop(200);
+
+    expect($commands)->toBe(['lpop'])
+        ->and(array_column(array_column($entries, 'payload'), 'id'))->toBe(['e1', 'e2', 'e3']);
+});
+
+it('does not mistake a refused batch pop for an empty spool', function () {
+    // phpredis answers both an empty list and a command it could not
+    // run with false. Reading "could not run" as "empty" would make
+    // the spool look permanently drained on Redis before 6.2 — silent,
+    // total data loss with the daemon reporting success throughout.
+    //
+    // Driven through a connection that refuses the count form, which
+    // is the premise: setting a flag would prove nothing.
+    $factory = new class(app(Factory::class)) implements Factory
+    {
+        public function __construct(private readonly Factory $inner) {}
+
+        public function connection($name = null)
+        {
+            return new class($this->inner->connection($name)) extends Connection
+            {
+                public function __construct(private readonly Connection $inner) {}
+
+                public function command($method, array $parameters = [])
+                {
+                    // An old server: the count form is not understood.
+                    // Older clients raise that rather than returning
+                    // false, so both shapes are exercised — the throw
+                    // is the one that stopped the spool draining
+                    // entirely.
+                    if ($method === 'lpop' && count($parameters) > 1) {
+                        throw new RuntimeException("ERR wrong number of arguments for 'lpop' command");
+                    }
+
+                    return $this->inner->command($method, $parameters);
+                }
+
+                public function createSubscription($channels, Closure $callback, $method = 'subscribe') {}
+
+                public function client()
+                {
+                    return $this->inner->client();
+                }
+            };
+        }
+    };
+
+    $spool = new RedisSpool($factory, 'default', $this->key, maxItems: 100);
+
+    foreach (range(1, 3) as $i) {
+        $spool->push(spoolEntry("e{$i}"));
+    }
+
+    $entries = $spool->pop(200);
+
+    expect(array_column(array_column($entries, 'payload'), 'id'))->toBe(['e1', 'e2', 'e3'])
+        ->and($spool->size())->toBe(0);
+});
+
+it('falls back when the old server THROWS rather than answering false', function () {
+    // The same Redis, a different client. Catching the rejection and
+    // calling it an empty list meant the spool never drained again,
+    // with the daemon reporting success on every pass.
+    $factory = new class(app(Factory::class)) implements Factory
+    {
+        public function __construct(private readonly Factory $inner) {}
+
+        public function connection($name = null)
+        {
+            return new class($this->inner->connection($name)) extends Connection
+            {
+                public function __construct(private readonly Connection $inner) {}
+
+                public function command($method, array $parameters = [])
+                {
+                    if ($method === 'lpop' && count($parameters) > 1) {
+                        throw new RuntimeException("ERR wrong number of arguments for 'lpop' command");
+                    }
+
+                    return $this->inner->command($method, $parameters);
+                }
+
+                public function createSubscription($channels, Closure $callback, $method = 'subscribe') {}
+
+                public function client()
+                {
+                    return $this->inner->client();
+                }
+            };
+        }
+    };
+
+    $spool = new RedisSpool($factory, 'default', $this->key, maxItems: 100);
+    $spool->push(spoolEntry('a'));
+    $spool->push(spoolEntry('b'));
+
+    expect(array_column(array_column($spool->pop(50), 'payload'), 'id'))->toBe(['a', 'b']);
+});
+
+it('ships nothing rather than skipping entries when a pop fails ambiguously', function () {
+    // A timeout is not a rejection: the command may have run and only
+    // its reply been lost, and popping again would step over entries
+    // that are already off the list.
+    $factory = new class(app(Factory::class)) implements Factory
+    {
+        public function __construct(private readonly Factory $inner) {}
+
+        public function connection($name = null)
+        {
+            return new class($this->inner->connection($name)) extends Connection
+            {
+                public function __construct(private readonly Connection $inner) {}
+
+                public function command($method, array $parameters = [])
+                {
+                    if ($method === 'lpop' && count($parameters) > 1) {
+                        throw new RuntimeException('read error on connection to 127.0.0.1:6379');
+                    }
+
+                    return $this->inner->command($method, $parameters);
+                }
+
+                public function createSubscription($channels, Closure $callback, $method = 'subscribe') {}
+
+                public function client()
+                {
+                    return $this->inner->client();
+                }
+            };
+        }
+    };
+
+    $spool = new RedisSpool($factory, 'default', $this->key, maxItems: 100);
+    $spool->push(spoolEntry('a'));
+
+    expect($spool->pop(50))->toBe([])
+        ->and($spool->size())->toBe(1);
 });

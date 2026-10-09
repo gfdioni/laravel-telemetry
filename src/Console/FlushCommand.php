@@ -38,6 +38,24 @@ use Illuminate\Support\Facades\Log;
  */
 final class FlushCommand extends Command
 {
+    /**
+     * Seconds the shutdown drain may spend.
+     *
+     * Supervisors send SIGTERM and then SIGKILL, typically ten seconds
+     * later. A drain that outlasts that is not a graceful shutdown; it
+     * is a kill with extra steps, and the spool survives either way.
+     */
+    private const SHUTDOWN_DRAIN_SECONDS = 5.0;
+
+    /**
+     * Seconds a one-shot run may spend draining the spool.
+     *
+     * Long enough to clear a real backlog, bounded so a producer that
+     * keeps the spool fed cannot keep the process alive until the next
+     * cron tick starts behind it.
+     */
+    private const CRON_DRAIN_SECONDS = 50.0;
+
     protected $signature = 'telemetry:flush
                             {--daemon : Keep running, shipping the spool every --interval seconds}
                             {--interval=1 : Seconds between spool ships in daemon mode}
@@ -109,15 +127,50 @@ final class FlushCommand extends Command
         }
 
         if ($shipper !== null) {
-            $result = FailSafe::guard(fn () => $shipper->ship((int) $this->option('max-batch')));
+            // Until the spool is empty, not until the first budget runs
+            // out. A one-shot run that shipped its ten thousand and
+            // reported success left the rest for the next cron tick,
+            // so a backlog could grow across runs that all looked fine.
+            $maxBatch = (int) $this->option('max-batch');
+            $shipped = new ShipResult;
 
-            if ($result === null) {
-                $this->components->error('Failed to ship the spool — see the configured exception handler for details.');
+            // Until the spool is empty OR the run has had long enough.
+            // Draining until the first budget ran out left the rest for
+            // the next tick, so a backlog could grow across runs that
+            // all reported success — and draining until empty is a loop
+            // a busy producer can keep fed forever, which is a cron job
+            // that never exits and a second one starting behind it.
+            $deadline = microtime(true) + self::CRON_DRAIN_SECONDS;
 
-                return self::FAILURE;
+            do {
+                $result = FailSafe::guard(fn () => $shipper->ship(
+                    $maxBatch,
+                    shouldStop: fn (): bool => $this->shouldStop,
+                    maxSeconds: max(1.0, $deadline - microtime(true)),
+                ));
+
+                if ($result === null) {
+                    $this->components->error('Failed to ship the spool — see the configured exception handler for details.');
+
+                    return self::FAILURE;
+                }
+
+                $shipped = $shipped->plus($result);
+            } while (! $result->drained && ! $result->waiting && ! $this->shouldStop && microtime(true) < $deadline);
+
+            $healthy = $this->reportSpool($shipped) && $healthy;
+
+            // A run that stopped with a backlog is not a clean run,
+            // whatever it managed to ship. Reporting success there is
+            // how a spool grows across cron ticks that all look fine.
+            if (! $shipped->drained && ! $shipped->waiting) {
+                $this->components->warn(sprintf(
+                    'The spool still has %d payload(s) — the drain stopped on its time budget.',
+                    FailSafe::guard(fn (): int => $this->laravel->make(Spool::class)->size()) ?? 0,
+                ));
+
+                $healthy = false;
             }
-
-            $healthy = $this->reportSpool($result) && $healthy;
         }
 
         if ($this->option('wipe')) {
@@ -157,8 +210,27 @@ final class FlushCommand extends Command
         $lastMetricsFlush = 0.0;
 
         while (! $this->shouldStop) {
+            $backlog = false;
+
             if ($shipper !== null) {
-                $this->watchSpool(FailSafe::guard(fn () => $shipper->ship($maxBatch)));
+                $result = FailSafe::guard(fn () => $shipper->ship(
+                    $maxBatch,
+                    shouldStop: fn (): bool => $this->shouldStop,
+                    maxSeconds: (float) $interval,
+                ));
+
+                $this->watchSpool($result);
+
+                // The drain stopped on its budget, not on an empty
+                // spool. Sleeping now would let a backlog built up
+                // during an outage take hours to clear at one budget
+                // per interval.
+                //
+                // Unless it is waiting out a Retry-After: then there
+                // IS nothing to come back for, and skipping the sleep
+                // spins the daemon at full speed for the length of the
+                // cooldown the backend asked for.
+                $backlog = $result !== null && ! $result->drained && ! $result->waiting;
             }
 
             if (microtime(true) - $lastMetricsFlush >= $metricsInterval) {
@@ -171,14 +243,21 @@ final class FlushCommand extends Command
                 $lastMetricsFlush = microtime(true);
             }
 
-            sleep($interval);
+            if (! $backlog) {
+                sleep($interval);
+            }
         }
 
-        // One last drain of what arrived during shutdown. Anything the
-        // endpoint still rejects stays durably in Redis and the next
-        // daemon start picks it up — the spool survives restarts.
+        // One last drain of what arrived during shutdown, on a short
+        // clock. Whatever does not fit stays durably in Redis and the
+        // next daemon start picks it up — a spool that survives
+        // restarts is worth more than one more batch shipped past the
+        // supervisor's patience.
         if ($shipper !== null) {
-            $this->watchSpool(FailSafe::guard(fn () => $shipper->ship($maxBatch)));
+            $this->watchSpool(FailSafe::guard(fn () => $shipper->ship(
+                $maxBatch,
+                maxSeconds: self::SHUTDOWN_DRAIN_SECONDS,
+            )));
         }
 
         $this->components->info('Telemetry flush daemon stopped.');

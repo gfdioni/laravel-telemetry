@@ -5,20 +5,21 @@ declare(strict_types=1);
 namespace Cbox\Telemetry;
 
 use Cbox\Telemetry\Contracts\Exporter;
+use Cbox\Telemetry\Contracts\RedactsTelemetry;
 use Cbox\Telemetry\Contracts\TelemetryProvider;
 use Cbox\Telemetry\Events\TelemetryEvent;
 use Cbox\Telemetry\Metrics\Instruments\Counter;
 use Cbox\Telemetry\Metrics\Instruments\Gauge;
 use Cbox\Telemetry\Metrics\Instruments\Histogram;
-use Cbox\Telemetry\Metrics\Instruments\ObservableGauge;
+use Cbox\Telemetry\Metrics\Instruments\Observable;
 use Cbox\Telemetry\Metrics\MetricFamily;
+use Cbox\Telemetry\Metrics\MetricType;
 use Cbox\Telemetry\Metrics\Registry;
 use Cbox\Telemetry\Metrics\Stores\BufferedMetricStore;
 use Cbox\Telemetry\Support\ExportOutcome;
 use Cbox\Telemetry\Support\ExportReport;
 use Cbox\Telemetry\Support\ExportResult;
 use Cbox\Telemetry\Support\FailSafe;
-use Cbox\Telemetry\Support\Redactor;
 use Cbox\Telemetry\Support\Signal;
 use Cbox\Telemetry\Support\TelemetryBatch;
 use Cbox\Telemetry\Support\TraceParent;
@@ -69,6 +70,10 @@ class TelemetryManager
 
     private ?Closure $httpHostClassifier = null;
 
+    private ?Closure $queueClassifier = null;
+
+    private ?Closure $jobClassifier = null;
+
     private ?Closure $sessionResolver = null;
 
     private ?Closure $clientGeoResolver = null;
@@ -94,7 +99,7 @@ class TelemetryManager
         private readonly bool $tailDetails = false,
         private readonly float $slowRequestMs = 1000.0,
         private readonly float $slowSpanMs = 100.0,
-        private readonly ?Redactor $redactor = null,
+        private readonly ?RedactsTelemetry $redactor = null,
         private readonly bool $selfMetrics = true,
     ) {
         // A buffer-cap flush means the trace is pathological — keep every
@@ -124,15 +129,45 @@ class TelemetryManager
      * Without a callback: a push gauge (`->set(42)`).
      * With a callback: an observable gauge evaluated at scrape time.
      *
-     * @return ($callback is null ? Gauge : ObservableGauge)
+     * @return ($callback is null ? Gauge : Observable)
      */
     public function gauge(
         string $name,
         ?Closure $callback = null,
         string $description = '',
         string $unit = '',
-    ): Gauge|ObservableGauge {
+    ): Gauge|Observable {
         return $this->registry->gauge($name, $callback, $description, $unit);
+    }
+
+    /**
+     * A push instrument of any scalar shape — `gauge()` without a
+     * callback, with the instrument type spelled out. Use it when the
+     * absolute value you are setting is a sum rather than a level.
+     */
+    public function pushed(
+        string $name,
+        MetricType $type = MetricType::Gauge,
+        string $description = '',
+        string $unit = '',
+    ): Gauge {
+        return $this->registry->pushed($name, $type, $description, $unit);
+    }
+
+    /**
+     * An observed reading of any shape — the callback form of `gauge()`,
+     * with the instrument type spelled out. Use it when what you are
+     * reading is a sum rather than a level: bytes in use add across hosts,
+     * a fraction does not.
+     */
+    public function observable(
+        string $name,
+        Closure $callback,
+        MetricType $type = MetricType::Gauge,
+        string $description = '',
+        string $unit = '',
+    ): Observable {
+        return $this->registry->observable($name, $callback, $type, $description, $unit);
     }
 
     /**
@@ -646,6 +681,87 @@ class TelemetryManager
     }
 
     /**
+     * Classify queue names into bounded groups — or drop them from the
+     * metrics.
+     *
+     * `queue` is a label on every queue metric this package emits, and
+     * Laravel lets an application name a queue at dispatch time:
+     * `->onQueue("tenant-{$id}")` is an ordinary thing to write and a
+     * permanent series per tenant on half a dozen metrics, several of
+     * them histograms. On a platform with thousands of tenants that is
+     * not a slow dashboard, it is the metrics backend falling over.
+     *
+     *     Telemetry::classifyQueuesUsing(function (string $queue) {
+     *         return str_starts_with($queue, 'tenant-') ? 'tenant' : $queue;
+     *     });
+     *
+     * The group replaces `queue` on the METRICS only; spans keep the
+     * real name, because per-occurrence it costs nothing and it is what
+     * you need when reading one.
+     *
+     * Unlike the host classifier this one cannot drop a series — it
+     * collapses to `other` instead. Dropping an outgoing host is
+     * reasonable because you may genuinely not care about a customer's
+     * webhook endpoint; dropping a queue would silently remove work the
+     * application actually did from its own throughput numbers.
+     *
+     * @param  (Closure(string): ?string)|null  $classifier
+     */
+    public function classifyQueuesUsing(?Closure $classifier): void
+    {
+        $this->queueClassifier = $classifier;
+    }
+
+    /**
+     * @internal used by the queue instrumentation
+     */
+    /**
+     * Group job names before they become a metric label.
+     *
+     * `job.name` comes from the payload's displayName, which Laravel
+     * lets a job set for itself — and a job that names itself after
+     * what it is working on ("SyncTenant tenant-4812") is one
+     * permanent series per tenant on several histograms. The class
+     * name is bounded by the code and needs nothing; a displayName
+     * built at dispatch is bounded only by the application's
+     * discipline, and this is where it gets some.
+     *
+     *     Telemetry::classifyJobsUsing(fn (string $job) => Str::before($job, ' '));
+     *
+     * @param  (Closure(string): ?string)|null  $classifier
+     */
+    public function classifyJobsUsing(?Closure $classifier): void
+    {
+        $this->jobClassifier = $classifier;
+    }
+
+    public function classifyJob(?string $job): string
+    {
+        $job ??= 'unknown';
+
+        if ($this->jobClassifier === null) {
+            return $job;
+        }
+
+        $group = FailSafe::guard(fn () => ($this->jobClassifier)($job));
+
+        return is_string($group) && $group !== '' ? $group : 'other';
+    }
+
+    public function classifyQueue(?string $queue): string
+    {
+        $queue ??= 'default';
+
+        if ($this->queueClassifier === null) {
+            return $queue;
+        }
+
+        $group = FailSafe::guard(fn () => ($this->queueClassifier)($queue));
+
+        return is_string($group) && $group !== '' ? $group : 'other';
+    }
+
+    /**
      * Add BOUNDED extra labels (plan, tier, team — never ids with
      * unbounded cardinality) to the http.server.request.duration metric:
      *
@@ -1031,6 +1147,8 @@ class TelemetryManager
 
         $spans = $this->tracer->drain();
 
+        $this->recordDroppedSpans();
+
         if (! $forceDetails) {
             $spans = $this->applyTailDetailPolicy($spans);
         }
@@ -1040,9 +1158,17 @@ class TelemetryManager
 
         // The redaction engine — the last hands on every attribute value
         // before an exporter sees it.
+        //
+        // A redactor that THREW is a redactor that did not redact, so
+        // the batch is dropped rather than exported. This used to fall
+        // back to the original, which meant a bug in a custom
+        // RedactsTelemetry — or in this package's own — shipped
+        // passwords to a third-party backend. Losing a batch costs a
+        // gap in a dashboard; the other costs a disclosure, and only
+        // one of those can be undone.
         if ($this->redactor !== null) {
-            $spans = FailSafe::guard(fn (): array => $this->redactor->spans($spans)) ?? $spans;
-            $events = FailSafe::guard(fn (): array => $this->redactor->events($events)) ?? $events;
+            $spans = FailSafe::guard(fn (): array => $this->redactor->spans($spans)) ?? [];
+            $events = FailSafe::guard(fn (): array => $this->redactor->events($events)) ?? [];
         }
 
         if ($spans === [] && $events === []) {
@@ -1076,7 +1202,7 @@ class TelemetryManager
         }
 
         if ($this->redactor !== null) {
-            $spans = FailSafe::guard(fn (): array => $this->redactor->spans($spans)) ?? $spans;
+            $spans = FailSafe::guard(fn (): array => $this->redactor->spans($spans)) ?? [];
         }
 
         $this->flushing = true;
@@ -1103,7 +1229,7 @@ class TelemetryManager
         }
 
         if ($this->redactor !== null) {
-            $events = FailSafe::guard(fn (): array => $this->redactor->events($events)) ?? $events;
+            $events = FailSafe::guard(fn (): array => $this->redactor->events($events)) ?? [];
         }
 
         $this->flushing = true;
@@ -1314,6 +1440,28 @@ class TelemetryManager
     }
 
     /**
+     * Spans the tracer refused because its buffer was full and would
+     * not drain. Silence here would be the worst kind: a trace with
+     * holes in it that looks complete.
+     */
+    private function recordDroppedSpans(): void
+    {
+        if (! $this->selfMetrics) {
+            return;
+        }
+
+        $dropped = $this->tracer->takeDroppedSpans();
+
+        if ($dropped === 0) {
+            return;
+        }
+
+        FailSafe::guard(fn () => $this->registry
+            ->counter('telemetry.spans.dropped', 'Spans discarded because the buffer was full')
+            ->inc((float) $dropped));
+    }
+
+    /**
      * Self-observability: how the exporters themselves are doing. These
      * are plain store writes (no export inline), so there is no feedback
      * loop — they ship on the next metrics flush like any counter.
@@ -1338,8 +1486,8 @@ class TelemetryManager
                 default => 'failed',
             };
 
-            $this->registry->histogram('telemetry.export.duration', description: 'Telemetry export duration', unit: 'ms')
-                ->record((microtime(true) - $startedAt) * 1000, $labels);
+            $this->registry->histogram('telemetry.export.duration', description: 'Telemetry export duration', unit: 's')
+                ->record(microtime(true) - $startedAt, $labels);
 
             $this->registry->counter('telemetry.export.count', 'Telemetry export attempts by outcome')
                 ->inc(1, $labels + ['outcome' => $outcome]);

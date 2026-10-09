@@ -1,0 +1,283 @@
+<?php
+
+declare(strict_types=1);
+
+use Cbox\Telemetry\Contracts\RedactsTelemetry;
+use Cbox\Telemetry\Support\Redactor;
+use Cbox\Telemetry\Tracing\Span;
+use Cbox\Telemetry\Tracing\SpanKind;
+
+/**
+ * A name list is enough for context you set yourself — you chose the
+ * key. It is not enough for auto-instrumentation, where the URLs belong
+ * to whatever third-party API the application calls and nobody has
+ * enumerated `?t=`, `?sas=`, or whatever the next vendor names its
+ * token.
+ *
+ * So the model has two halves, and this asserts both: what the name
+ * says, and what the value looks like when the name says nothing.
+ */
+/**
+ * A credential-shaped string, assembled at runtime.
+ *
+ * Spelled out as a literal, `sk_live_` followed by twenty-four base62
+ * characters is Stripe's own documented example key — and GitHub's push
+ * protection recognises it and refuses the push. It is right to: a
+ * scanner cannot tell a fixture from a leak, and a repository whose
+ * tests trip secret scanning is a repository whose contributors learn
+ * to click through the warning.
+ *
+ * The redactor needs the SHAPE, and a shape only has to exist when the
+ * test runs. Prefix and body are separate strings here, so the file
+ * contains no credential-shaped literal and the assertion is unchanged.
+ */
+function credentialShaped(string $prefix = 'sk_live_'): string
+{
+    return $prefix.'Kq7mZt2Rb9Xw4Ns6Vd1Hy8Pc';
+}
+
+function redactUrl(string $query): string
+{
+    $redactor = Redactor::fromConfig(config('telemetry.redaction'));
+
+    $span = new Span('t', 's', null, 'x', SpanKind::Client, true, [
+        'url.full' => 'https://api.test/v1?'.$query,
+    ], static fn () => null);
+
+    return (string) $redactor->spans([$span])[0]->attributes()['url.full'];
+}
+
+it('redacts every spelling of a credential parameter', function (string $name) {
+    // An ordinary lowercase word, deliberately. A mixed-case
+    // alphanumeric secret is caught by the SHAPE rule whatever it is
+    // called, so this test passed with the name matcher switched off
+    // entirely — it proved the other half of the model. The control
+    // below is what keeps that honest.
+    $secret = 'swordfish';
+
+    expect(redactUrl("colour={$secret}"))->toContain($secret)
+        ->and(redactUrl("{$name}={$secret}"))->not->toContain($secret);
+})->with([
+    // Plain, and the separators a header-ish spelling uses.
+    'api_key', 'apikey', 'api-key', 'x-api-key', 'token', 'secret', 'password',
+    // camelCase, which is what a JavaScript-facing API uses — and which
+    // the matcher could not see until it learnt to split on a capital.
+    'apiKey', 'accessToken', 'clientSecret', 'refreshToken',
+    // Ambiguous words behind a qualifier that settles them. `key`
+    // alone could be a sort key; `private_key` could not.
+    'private_key', 'api_key', 'client_secret', 'session_id', 'sessionid',
+    'access_code', 'master_key', 'consumer_secret',
+    // Run-of-capitals names, where splitting per letter would be worse
+    // than not splitting at all.
+    'AWSAccessKeyId', 'X-Goog-Signature',
+]);
+
+it('redacts a value that looks like a credential whatever it was called', function (string $name) {
+    // The half a name list cannot do. These are real parameter names
+    // from real APIs, and no list will ever have them all.
+    $secret = credentialShaped();
+
+    expect(redactUrl("{$name}={$secret}"))->not->toContain($secret);
+})->with(['t', 'k', 'sas', 'se', 'x', 'v', 'cursor', 'opaque']);
+
+it('recognises the issuers that stamp their keys', function (string $value) {
+    expect(redactUrl("q={$value}"))->not->toContain($value);
+})->with([
+    // Assembled rather than written out, for the reason in
+    // credentialShaped()'s docblock.
+    credentialShaped(),
+    'ghp_16C7e42F292c6912E7710c838347Ae178B4a',
+    'xoxb-1234-5678-abcdefghijklmnop',
+    'AKIAIOSFODNN7EXAMPLE',
+    'AIzaSyD-1234567890abcdefghijklmnopqrst',
+    'glpat-ABCdef123456789012345',
+]);
+
+it('leaves the things an operator actually needs to read', function (string $pair) {
+    // Redaction that eats real data is its own outage. An operator who
+    // cannot read the URLs stops trusting the tool, and then nobody
+    // reads any of it.
+    expect(redactUrl($pair))->toContain($pair);
+})->with([
+    'limit=25',
+    'page=3',
+    'sort=created_at',
+    'q=hello+world',
+    'slug=my-great-article-about-things',
+    'date=2026-09-26T12:00:00Z',
+    'id=1234567890',
+    // A UUID is an identifier, and the most common long value in a real
+    // query string. Excluded by shape, deliberately.
+    'order=8f14e45f-ceea-467a-9c7f-1b2c3d4e5f60',
+    // The ambiguous words behind a qualifier that does NOT settle them.
+    // A blanket suffix rule caught all of these, which is how the first
+    // attempt at this broke a test written to protect them.
+    'postal_code=2100',
+    'sort_key=price',
+    'status_code=404',
+    'zip_code=90210',
+]);
+
+it('sees a secret through percent-encoding on both sides', function () {
+    // `%74oken` is `token` to the application and to no regex that does
+    // not decode; and the value is encoded just as often as the name.
+    expect(redactUrl('%74oken=SECRETVALUE123abcXYZ0987'))->not->toContain('SECRETVALUE123abcXYZ0987')
+        // Percent-encoded underscores: the prefix rule has to see the
+        // DECODED value, which is the whole point of this assertion.
+        ->and(redactUrl('q='.str_replace('_', '%5F', credentialShaped())))
+        ->not->toContain(substr(credentialShaped(), 8));
+});
+
+it('is configurable without writing a class', function () {
+    config()->set('telemetry.redaction.credential_prefixes', ['acme_tok_']);
+    config()->set('telemetry.redaction.value_shape', false);
+
+    // The app's own issuer prefix, unioned with the package's.
+    expect(redactUrl('q=acme_tok_abcdef'))->not->toContain('acme_tok_abcdef')
+        ->and(redactUrl('q='.credentialShaped()))->not->toContain(credentialShaped());
+
+    // Shape detection off: an unrecognised long value is kept.
+    expect(redactUrl('t=SECRETVALUE123abcXYZ0987'))->toContain('SECRETVALUE123abcXYZ0987');
+});
+
+it('can be replaced outright by binding the contract', function () {
+    // The escape hatch for an organisation whose redaction policy is
+    // its own: a compliance list, a shared internal package, a scanner
+    // that already exists elsewhere in the estate.
+    app()->bind(RedactsTelemetry::class, fn (): RedactsTelemetry => new class implements RedactsTelemetry
+    {
+        public function spans(array $spans): array
+        {
+            return [];
+        }
+
+        public function events(array $events): array
+        {
+            return [];
+        }
+
+        public function redactStructure(array $values, int $depth = 0): array
+        {
+            return [];
+        }
+
+        public function redactUsing(?Closure $custom): void {}
+
+        public function value(string|int $key, string $value): string
+        {
+            return '[GONE]';
+        }
+
+        public function keyIsSensitive(string $key): bool
+        {
+            return true;
+        }
+
+        public function valueLooksLikeCredential(string $value): bool
+        {
+            return true;
+        }
+
+        public function personalDataDetectors(): array
+        {
+            // An implementation with no such concept says so, and
+            // telemetry:doctor reports "not scrubbed" rather than
+            // guessing.
+            return [];
+        }
+    });
+
+    expect(app(RedactsTelemetry::class)->spans([]))->toBe([])
+        ->and(app(RedactsTelemetry::class)->keyIsSensitive('anything'))->toBeTrue()
+        ->and(app(RedactsTelemetry::class)->value('url.full', 'https://x.test'))->toBe('[GONE]');
+});
+
+it('reads every spelling of a parameter name as the same parameter', function (string $name) {
+    // An application does not control what a third-party API calls its
+    // token, and an attacker picks the spelling deliberately. All of
+    // these reached an independent review's probe intact.
+    expect(Redactor::parameterIsCredential($name))->toBeTrue();
+})->with([
+    'accessToken%5B0%5D',   // brackets survived the camel split
+    'x-accessToken',        // a separator made the splitter give up
+    'ACCESSTOKEN',          // nothing to split on at all
+    'AWSAccessKeyId',       // the credential word is not the suffix
+    'access+token',         // PHP parses + as a separator
+    'access%20token',       // and a literal space
+    'apiKey',
+    'x-api-key',
+    'token%5Ba%5D%5Bb%5D',
+]);
+
+it('still keeps the parameters an application is made of', function (string $name) {
+    // Loosening the matcher is only safe if it stays shut on these.
+    expect(Redactor::parameterIsCredential($name))->toBeFalse();
+})->with([
+    'sortkey', 'postalcode', 'barcode', 'design', 'statuscode',
+    'limit', 'page', 'username', 'nickname', 'postal_code', 'sort_key',
+    // A count of tokens, a count of secrets, the NAME of a key, and a
+    // boolean. Matching a credential word anywhere in the name took
+    // all four — the suite caught it, which is what it is for.
+    'token_count', 'secret_count', 'api_key_name', 'signature_required',
+    'order_id', 'country_code', 'order_state',
+]);
+
+it('reads camelCase attribute keys as sensitive too', function () {
+    // The parameter matcher and the KEY matcher are separate passes,
+    // and only one of them had learnt this.
+    $redactor = Redactor::fromConfig(config('telemetry.redaction'));
+
+    expect($redactor->keyIsSensitive('stripe.accessToken'))->toBeTrue()
+        ->and($redactor->keyIsSensitive('log.context.clientSecret'))->toBeTrue()
+        // And not a word that merely contains one.
+        ->and($redactor->keyIsSensitive('cache.key'))->toBeFalse()
+        ->and($redactor->keyIsSensitive('http.route'))->toBeFalse();
+});
+
+it('recognises the credential shapes a narrower reading of the spec missed', function (string $value, string $secret) {
+    expect(Redactor::fromConfig(config('telemetry.redaction'))->value('log.context.message', $value))
+        ->not->toContain($secret);
+})->with([
+    // A JWT header is JSON, and JSON may carry whitespace: written
+    // with a newline it is base64 `ewo`, not `eyJ`.
+    'jwt with a whitespace header' => [
+        'token ewogICJhbGciOiAiSFMyNTYiCn0.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U rejected',
+        'dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U',
+    ],
+    // No username. Still a password in a URL.
+    'userinfo with no username' => ['redis://:hunter2@cache.internal:6379', 'hunter2'],
+    // A one-time code presented as a bearer token is a bearer token.
+    'short numeric bearer' => ['Authorization: Bearer 483920', '483920'],
+]);
+
+it('still leaves an auth-param list alone', function (string $value) {
+    // The reason the Bearer rule has shapes at all: a real
+    // WWW-Authenticate header is not a credential.
+    expect(Redactor::fromConfig(config('telemetry.redaction'))->value('log.context.message', $value))->toBe($value);
+})->with([
+    'Bearer error=invalid_token',
+    'Bearer realm=api',
+    'Bearer Authentication',
+]);
+
+it('redacts a JWT however its header was formatted', function (string $header) {
+    // A JWT header is JSON, so its second byte can be any whitespace
+    // JSON allows — and base64 turns each of those into a different
+    // third character. Enumerating prefixes kept missing one; the
+    // first TWO characters are always `ey` or `ew`, and that is
+    // derivable rather than guessable.
+    $token = implode('.', [
+        rtrim(strtr(base64_encode($header), '+/', '-_'), '='),
+        'eyJzdWIiOiIxMjM0NTY3ODkwIn0',
+        'dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U',
+    ]);
+
+    expect(Redactor::fromConfig(config('telemetry.redaction'))->value('log.context.message', "token {$token} rejected"))
+        ->not->toContain('dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U');
+})->with([
+    'compact' => ['{"alg":"HS256","typ":"JWT"}'],
+    'leading space' => ['{ "alg":"HS256","typ":"JWT"}'],
+    'leading newline' => ["{\n  \"alg\":\"HS256\"}"],
+    'leading CRLF' => ["{\r\n  \"alg\":\"HS256\"}"],
+    'leading tab' => ["{\t\"alg\":\"HS256\"}"],
+]);

@@ -5,7 +5,7 @@ declare(strict_types=1);
 use Cbox\Telemetry\Exceptions\InstrumentTypeMismatch;
 use Cbox\Telemetry\Exceptions\InvalidMetricName;
 use Cbox\Telemetry\Metrics\Instruments\Gauge;
-use Cbox\Telemetry\Metrics\Instruments\ObservableGauge;
+use Cbox\Telemetry\Metrics\Instruments\Observable;
 use Cbox\Telemetry\Metrics\MetricType;
 use Cbox\Telemetry\Metrics\Registry;
 use Cbox\Telemetry\Metrics\Stores\ArrayMetricStore;
@@ -36,7 +36,7 @@ it('returns a push gauge without a callback and an observable with one', functio
     $registry = registry();
 
     expect($registry->gauge('cache.keys'))->toBeInstanceOf(Gauge::class)
-        ->and($registry->gauge('queue.depth', fn () => 42))->toBeInstanceOf(ObservableGauge::class);
+        ->and($registry->gauge('queue.depth', fn () => 42))->toBeInstanceOf(Observable::class);
 });
 
 it('collects push metrics and observable gauges together', function () {
@@ -147,4 +147,26 @@ it('records no exemplar when no resolver is configured', function () {
     $registry->histogram('checkout.duration')->record(5.0);
 
     expect($registry->collect()[0]->samples[0]->exemplar)->toBeNull();
+});
+
+it('times in the instrument own unit, not a fixed one', function (): void {
+    // A histogram declared in seconds filled by a helper that always wrote
+    // milliseconds is wrong by a factor of a thousand, and nothing about
+    // the reading looks odd. 20ms must read as 0.02, not 20.
+    $registry = registry();
+
+    $registry->histogram('unit.test.seconds', unit: 's', buckets: [0.01, 0.1, 1.0])
+        ->time(fn () => usleep(20_000));
+
+    $registry->histogram('unit.test.ms', unit: 'ms', buckets: [10.0, 100.0, 1000.0])
+        ->time(fn () => usleep(20_000));
+
+    $families = [];
+
+    foreach ($registry->collect() as $family) {
+        $families[$family->definition->name] = $family->samples[0];
+    }
+
+    expect($families['unit.test.seconds']->sum)->toBeGreaterThan(0.01)->toBeLessThan(1.0)
+        ->and($families['unit.test.ms']->sum)->toBeGreaterThan(10.0)->toBeLessThan(1000.0);
 });

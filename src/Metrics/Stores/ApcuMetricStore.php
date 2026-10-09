@@ -49,7 +49,7 @@ final class ApcuMetricStore implements MetricStore
         $series = Labels::encode($labels);
 
         $this->index($definition, $series);
-        apcu_store($this->valueKey(MetricType::Gauge, $definition->name, $series), $this->toInt($value));
+        apcu_store($this->valueKey($this->scalarType($definition), $definition->name, $series), $this->toInt($value));
     }
 
     public function addGauge(MetricDefinition $definition, array $labels, float $delta): void
@@ -57,7 +57,17 @@ final class ApcuMetricStore implements MetricStore
         $series = Labels::encode($labels);
 
         $this->index($definition, $series);
-        $this->addFloat($this->valueKey(MetricType::Gauge, $definition->name, $series), $delta);
+        $this->addFloat($this->valueKey($this->scalarType($definition), $definition->name, $series), $delta);
+    }
+
+    /**
+     * The storage namespace for a scalar push write: the definition's own
+     * type, so an up-down counter or a counter written as an absolute
+     * value comes back out declared as one.
+     */
+    private function scalarType(MetricDefinition $definition): MetricType
+    {
+        return $definition->type === MetricType::Histogram ? MetricType::Gauge : $definition->type;
     }
 
     public function recordHistogram(MetricDefinition $definition, array $labels, float $value, ?Exemplar $exemplar = null): void
@@ -80,6 +90,10 @@ final class ApcuMetricStore implements MetricStore
 
     public function mergeHistogram(MetricDefinition $definition, array $labels, array $bucketCounts, float $sum, int $count, ?Exemplar $exemplar = null): void
     {
+        if (! is_finite($sum)) {
+            return;
+        }
+
         $series = Labels::encode($labels);
         $base = $this->valueKey(MetricType::Histogram, $definition->name, $series);
 
@@ -136,7 +150,7 @@ final class ApcuMetricStore implements MetricStore
     {
         $families = [];
 
-        foreach ([MetricType::Counter, MetricType::Gauge] as $type) {
+        foreach ([MetricType::Counter, MetricType::UpDownCounter, MetricType::Gauge] as $type) {
             foreach ($this->names($type) as $name) {
                 $definition = $this->definition($type, $name);
 
@@ -315,21 +329,34 @@ final class ApcuMetricStore implements MetricStore
 
         apcu_add($this->sinceKey($type, $definition->name), (int) (microtime(true) * 1e9));
 
-        $this->appendUnique($this->nameIndexKey($type), $definition->name);
-        $this->appendUnique($this->seriesIndexKey($type, $definition->name), $series);
+        // Both, on separate lines, so neither is skipped by a
+        // short-circuit when the other loses its lock.
+        $nameIndexed = $this->appendUnique($this->nameIndexKey($type), $definition->name);
+        $seriesIndexed = $this->appendUnique($this->seriesIndexKey($type, $definition->name), $series);
 
-        $this->indexed[$memo] = $now;
+        // Only memoize what actually landed. An append that gave up on
+        // lock contention and was memoized anyway meant this process
+        // spent the next five minutes writing a series collect() could
+        // not find — invisible data, which is worse than none, because
+        // the dashboard shows a gap and nothing shows why.
+        if ($nameIndexed && $seriesIndexed) {
+            $this->indexed[$memo] = $now;
+        }
     }
 
     /**
      * Append a value to a list key if missing, guarded by a spin lock.
+     *
+     * @return bool whether the value is in the list now — false means the
+     *              lock was never won, and the caller must not record this
+     *              series as indexed
      */
-    private function appendUnique(string $key, string $value): void
+    private function appendUnique(string $key, string $value): bool
     {
         $current = apcu_fetch($key);
 
         if (is_array($current) && in_array($value, $current, true)) {
-            return;
+            return true;
         }
 
         $lock = "{$key}:lock";
@@ -339,18 +366,28 @@ final class ApcuMetricStore implements MetricStore
                 $current = apcu_fetch($key);
                 $current = is_array($current) ? $current : [];
 
+                $stored = true;
+
                 if (! in_array($value, $current, true)) {
                     $current[] = $value;
-                    apcu_store($key, $current);
+
+                    // apcu_store() answers false when the segment is
+                    // full — the exact moment an index write matters
+                    // most. Reporting success here memoized a write
+                    // that never happened, and the series stayed
+                    // invisible to collect() for five minutes.
+                    $stored = apcu_store($key, $current);
                 }
 
                 apcu_delete($lock);
 
-                return;
+                return $stored;
             }
 
             usleep(100);
         }
+
+        return false;
     }
 
     /**

@@ -54,9 +54,17 @@ return [
         // Deployment marker (git sha, release tag) — shows on every
         // signal so regressions map to deploys.
         'deployment' => env('TELEMETRY_SERVICE_DEPLOYMENT'),
+
+        // service.instance.id — what Prometheus's and Mimir's OTLP
+        // receivers turn into the `instance` label. Always set: unset
+        // here, it is host.name for a store on this host (the same in
+        // every FPM worker), or a fingerprint of a shared Redis (the same
+        // on every host, since its one total must stay one series).
+        'instance_id' => env('TELEMETRY_SERVICE_INSTANCE_ID'),
     ],
 
-    // Auto-detect container/k8s/cloud resource attributes (container.id,
+    // Auto-detect host/container/k8s/cloud resource attributes (host.name,
+    // host.arch, container.id,
     // k8s.pod.name, k8s.namespace.name, cloud.region, …) from cgroup
     // facts (via cboxdk/system-metrics), well-known downward-API env vars
     // and OTEL_RESOURCE_ATTRIBUTES. Config service.* keys always win.
@@ -105,6 +113,19 @@ return [
         'redis' => [
             'connection' => env('TELEMETRY_REDIS_CONNECTION', 'default'),
             'prefix' => env('TELEMETRY_REDIS_PREFIX', 'telemetry'),
+
+            // The last line of defence against a runaway label: the most
+            // hash fields ONE metric family may hold before new series
+            // are refused. Existing series keep being written, and the
+            // refusals are counted into a `__overflow` field that
+            // `telemetry:doctor` reports — a ceiling nobody is told
+            // about is just missing data.
+            //
+            // A field is not a series: a histogram spends one per bucket
+            // plus a sum and a count, so ~14 fields per series on the
+            // default ladder. The default is far above any sane label
+            // set and exists for the ones that are not. 0 disables it.
+            'max_fields' => env('TELEMETRY_REDIS_MAX_FIELDS', 50000),
         ],
 
         'apcu' => [
@@ -232,6 +253,14 @@ return [
         // (protects long-running jobs and Octane workers).
         'max_buffer' => env('TELEMETRY_TRACES_MAX_BUFFER', 5000),
 
+        // And the same in bytes, because five thousand spans is a
+        // sensible ceiling for ordinary spans and no ceiling at all for
+        // spans carrying a 100KB query or a serialized payload. Whole
+        // spans are dropped past it, counted as telemetry.spans.dropped
+        // — never a truncated value, which would cut a credential in
+        // half before redaction could recognise it. 0 disables it.
+        'max_buffer_bytes' => env('TELEMETRY_TRACES_MAX_BUFFER_BYTES', 33554432),
+
         // Error spans are exported even from unsampled traces — a
         // 10%-sampled app still surfaces every failing span.
         'always_sample_errors' => env('TELEMETRY_TRACES_ALWAYS_SAMPLE_ERRORS', true),
@@ -250,6 +279,15 @@ return [
 
         // Trust incoming `traceparent` headers and continue remote traces.
         'continue_incoming' => env('TELEMETRY_TRACES_CONTINUE_INCOMING', true),
+
+        // Parent the request span to the incoming traceparent's span id.
+        // Disable behind an edge (load balancer, proxy) that injects
+        // traceparent so its access log joins your trace, but exports no
+        // span of its own: every request then hangs under a span that never
+        // arrives, and trace backends list it as missing its root. Off, the
+        // trace id is still adopted (the edge's log still joins), the
+        // request span is the root, and the edge's span id becomes a link.
+        'continue_incoming_parent' => env('TELEMETRY_TRACES_CONTINUE_INCOMING_PARENT', true),
 
         // Tail detail retention: keep detail spans (cache ops, queries)
         // only for traces with errors or slowness — MANY details when it
@@ -286,11 +324,21 @@ return [
     |--------------------------------------------------------------------------
     |
     | Default bucket boundaries for histograms that don't declare their own.
-    | Values are in the instrument's native unit (durations: milliseconds).
+    | Values are in the instrument's native unit.
+    |
+    | The ladder tops out at 10 seconds, which suits a request and suits
+    | nothing that runs for minutes. A classic histogram reports the
+    | highest finite boundary for anything past it, so a queue an hour
+    | behind answers p95 = 10 and an alert set at 30 never fires — silently
+    | and forever. Long-running instruments pass their own ladders; do the
+    | same for yours.
     |
     */
 
-    'default_buckets' => [1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000],
+    // Seconds, per the semantic conventions: "When instruments are
+    // measuring durations, seconds (i.e. `s`) SHOULD be used." Every
+    // histogram that falls back to these is a duration.
+    'default_buckets' => [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
 
     /*
     |--------------------------------------------------------------------------
@@ -341,6 +389,81 @@ return [
         'safe_keys' => Redactor::defaultSafeKeys(),
 
         'replacement' => '[REDACTED]',
+
+        // Auto-instrumentation needs more than a name list.
+        //
+        // For a context value you set yourself, a list of key names is
+        // enough — you chose the key. The URLs this package records are
+        // not yours: they belong to whatever third-party API the
+        // application calls, and no list enumerates `?t=`, `?sas=` or
+        // whatever the next vendor decides to call its token.
+        //
+        // So a query-parameter value is ALSO judged by its shape, when
+        // its name said nothing.
+
+        // Issuer prefixes: unambiguous, free to check, and the reason
+        // every one of these vendors stamps its keys in the first place.
+        // Unioned with the package's list unless replace_defaults.
+        'credential_prefixes' => Redactor::defaultCredentialPrefixes(),
+
+        // The generic rule: a value this long, made only of token
+        // characters, with lower AND upper AND digits, is a generated
+        // credential and not a slug, an email, a date or a path. UUIDs
+        // are excluded by shape — a UUID in a URL is an id somebody
+        // needs to read.
+        //
+        // Set false to judge values by prefix only. Raise the length if
+        // your own identifiers trip it; lower it at your peril, because
+        // the false positives start immediately below here.
+        'value_shape' => env('TELEMETRY_REDACTION_VALUE_SHAPE', true),
+        'value_min_length' => env('TELEMETRY_REDACTION_VALUE_MIN_LENGTH', 24),
+
+        // Structured personal identifiers, found in free text. OFF by
+        // default, because it costs something per value and because
+        // removing data an operator needed is its own failure.
+        //
+        // This is a defence-in-depth CONTROL, not compliance. It catches
+        // identifiers that leaked in by accident — an email in an
+        // exception message, a card number in a SQL string, a CPR in a
+        // URL path — which is how personal data actually reaches an
+        // observability pipeline; nobody decides to put it there. No
+        // configuration of it makes an application GDPR-, HIPAA- or
+        // SOC 2-compliant: HIPAA names eighteen identifiers and this
+        // sees six, because a person's name, their address and a
+        // medical record number have no form to recognise. Those need
+        // the key rules above and the discipline not to put them in a
+        // span.
+        //
+        // Every detector that can be checksummed is: a sixteen-digit
+        // number is an order id far more often than a card, and without
+        // Luhn this would redact the primary key of every table in the
+        // application.
+        //
+        //   'pii' => true                              // the defaults
+        //   'pii' => ['detectors' => ['email', 'ip']]  // exactly these
+        //
+        // Available: email, credit_card, iban, us_ssn, dk_cpr, ip, phone.
+        // `ip` and `phone` are not in the defaults — an IP is also how
+        // you find the one host that is broken, and a bare phone number
+        // is indistinguishable from an order id.
+        'pii' => env('TELEMETRY_REDACTION_PII', false),
+
+        // The longest attribute value that reaches an exporter, in
+        // bytes. 0 disables the cap.
+        //
+        // This is the only place in the pipeline where a value is
+        // bounded at all — Span::setAttribute stores what it is given —
+        // so without it an application that puts a megabyte in an
+        // attribute sends a megabyte, at a collector that will probably
+        // reject the batch. It also bounds what the patterns above have
+        // to scan: several of them scale worse than linearly on a
+        // pathological value, and an exception message can contain
+        // whatever a user typed.
+        //
+        // The cut is marked, because a silently truncated value looks
+        // like a complete one and somebody will debug against a string
+        // that ends in the middle of the answer.
+        'max_value_length' => env('TELEMETRY_REDACTION_MAX_VALUE_LENGTH', 4096),
     ],
 
     /*
@@ -515,13 +638,25 @@ return [
         // ("{tenant}.app.example"), keeping wildcard-tenant cardinality
         // bounded.
         //
-        // Without a pattern the concrete host is only used when something
-        // has vouched for it — trusted-host patterns are configured, or it
-        // is the app's own host. Anything else reports "other", because
-        // $request->getHost() is otherwise just the caller's Host header
-        // and a label must never be caller-controlled. Configure
-        // TrustHosts to tell your domains apart.
+        // Without a pattern the concrete host is only used when it comes
+        // from a FINITE set the application named: app.url, the list in
+        // `hosts` below, or a trusted-host pattern with no wildcard in
+        // it. Anything else reports "other", because $request->getHost()
+        // is otherwise just the caller's Host header and a label must
+        // never be caller-controlled.
+        //
+        // Trusted hosts alone are not enough, which is worth saying
+        // plainly: they prove the host was VALIDATED, not that there are
+        // few of them. Laravel's own TrustHosts defaults to every
+        // subdomain of app.url, and an app behind wildcard DNS would
+        // have minted a permanent series per subdomain anyone asked for.
         'host_label' => env('TELEMETRY_INSTRUMENT_HOST_LABEL', true),
+
+        // Hosts kept as-is in server.address, for a multi-domain app
+        // whose domains cannot be enumerated in TrustHosts. The list is
+        // the application's, which is the whole point — every host not
+        // on it (and not covered by the rules above) reports "other".
+        'hosts' => [],
 
         // Methods reported as themselves on http.request.method; anything
         // else becomes "_OTHER", with the real one kept on the span as
@@ -582,6 +717,22 @@ return [
         // histograms (http.server.memory.peak / cpu.time, queue.job.*).
         'resources' => env('TELEMETRY_INSTRUMENT_RESOURCES', true),
 
+        // Whether to also take the OS process footprint (real RSS and
+        // CPU utilization) from cboxdk/system-metrics, on top of the PHP
+        // built-ins that `resources` always provides.
+        //
+        // null = decide by platform, and the platform matters enormously:
+        // on Linux this reads /proc/{pid}/stat and costs microseconds;
+        // everywhere else the library shells out to `ps`, which is ~28ms
+        // — twice per request and twice per job. On a developer's Mac
+        // that made this package the dominant cost of every request,
+        // fifty-six milliseconds to measure something that took two.
+        //
+        // Set true to take it anyway, false to never take it. When it is
+        // skipped, rssPeakBytes and cpuUtilization are simply absent,
+        // exactly as when system-metrics is not installed.
+        'resources_process' => env('TELEMETRY_INSTRUMENT_RESOURCES_PROCESS'),
+
         // Scheduled task spans + schedule.tasks.{processed,failed,skipped}
         // counters and schedule.task.duration histogram.
         'scheduled_tasks' => env('TELEMETRY_INSTRUMENT_SCHEDULED_TASKS', true),
@@ -628,6 +779,19 @@ return [
         'redis' => env('TELEMETRY_INSTRUMENT_REDIS', false),
         'redis_ignore_connections' => null,
 
+        // redis.commands.failed counter + an errored client span per Redis
+        // command that raised. On by default, and separate from `redis`
+        // above, because the two answer different questions: per-command
+        // spans are for profiling Redis, failures are for finding out that
+        // Redis is why everything else is failing. That signal has to be
+        // on before the incident, not switched on during it.
+        //
+        // Laravel dispatches CommandExecuted and CommandFailed from one
+        // switch, so this does cost an event dispatch per Redis command
+        // even when nothing fails — the listener is a single in_array and
+        // a return. Set to false on a hot path that cannot afford it.
+        'redis_failures' => env('TELEMETRY_INSTRUMENT_REDIS_FAILURES', true),
+
         // db.connect / redis.connect spans + the
         // db.client.connection.create_time histogram.
         //
@@ -644,9 +808,38 @@ return [
         // slow trace is trimmed.
         //
         // redis_connect honours redis_ignore_connections and always skips
-        // the package's own store and spool connections.
+        // the package's own store and spool connections. phpredis is timed
+        // in the connector; predis connects on the first command, so each
+        // node connection times itself then — under Sentinel that is one
+        // span for the sentinel asked and one for the master it named. A
+        // connection that sets its own predis `connections` factory is
+        // left alone.
         'db_connect' => env('TELEMETRY_INSTRUMENT_DB_CONNECT', true),
         'redis_connect' => env('TELEMETRY_INSTRUMENT_REDIS_CONNECT', true),
+
+        // Application lifecycle, not request path. Each fires a handful of
+        // times a day and each explains a chart that would otherwise only
+        // raise questions.
+        //
+        // migrations       db.migration.duration histogram +
+        //                  db.migrations.started / db.migration.ran /
+        //                  db.migrations.finished events. A schema change
+        //                  is the most common answer to "what changed at
+        //                  14:32", and a migration that holds a lock for
+        //                  four minutes is invisible without the histogram.
+        // maintenance_mode app.maintenance_mode events, so a planned
+        //                  window reads as a window and not an outage.
+        // connection_pool  db.connections.over_threshold counter + event,
+        //                  from Laravel's DatabaseBusy: the server's own
+        //                  connection count crossed the --max somebody
+        //                  gave db:monitor. Not a failed checkout, and not
+        //                  a client pool — but the count climbing is the
+        //                  difference between "the database is slow" and
+        //                  "everyone is queuing to talk to it", which have
+        //                  opposite fixes and identical symptoms.
+        'migrations' => env('TELEMETRY_INSTRUMENT_MIGRATIONS', true),
+        'maintenance_mode' => env('TELEMETRY_INSTRUMENT_MAINTENANCE_MODE', true),
+        'connection_pool' => env('TELEMETRY_INSTRUMENT_CONNECTION_POOL', true),
 
         // Gate/policy checks: authorization.checks{ability, result}
         // counter + gate.check.count / gate.denied.count root-span

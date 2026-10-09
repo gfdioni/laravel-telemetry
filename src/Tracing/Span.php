@@ -18,11 +18,51 @@ use Throwable;
  */
 final class Span
 {
+    /**
+     * Per-span limits, matching the OpenTelemetry SDK defaults.
+     *
+     * A span is built from whatever the application hands it — a loop
+     * that annotates per iteration, a job that adds an event per row —
+     * and nothing downstream bounds it. Held in memory until the
+     * request ends and then serialised whole, an unbounded span is a
+     * memory limit hit inside the observability code, which is the one
+     * place it must never happen.
+     *
+     * A small reserve above each limit is kept for this package's own
+     * error annotation: an exception event is the most valuable thing
+     * on a span, and losing it because a cache instrumentation filled
+     * the list would invert the priority.
+     */
+    private const MAX_ATTRIBUTES = 128;
+
+    private const MAX_EVENTS = 128;
+
+    private const RESERVE = 8;
+
+    /**
+     * Most bytes one span's content may occupy.
+     *
+     * The tracer's byte budget covers the FINISHED buffer, which is no
+     * help while a span is still open: one span accepted sixty-four
+     * 1MiB attributes and held 64MiB until it ended. A per-span
+     * ceiling is the only thing that bounds that, and refusing a whole
+     * attribute is the safe way to enforce it — truncating a value
+     * would cut a credential before redaction could read it.
+     */
+    private const MAX_BYTES = 2_097_152;
+
     /** @var array<string, scalar|null> */
     private array $attributes;
 
     /** @var list<SpanEvent> */
     private array $events = [];
+
+    private int $droppedAttributes = 0;
+
+    /** Running total of attribute bytes, for the per-span ceiling. */
+    private int $bytes = 0;
+
+    private int $droppedEvents = 0;
 
     /** @var list<SpanLink> */
     private array $links;
@@ -78,7 +118,15 @@ final class Span
         ?int $startUnixNano = null,
         array $links = [],
     ) {
-        $this->attributes = $attributes;
+        // Through the same gate as setAttribute(). Assigning the array
+        // straight through let `startSpan('x', attributes: $thousand)`
+        // past the limit entirely, and reported nothing dropped.
+        $this->attributes = [];
+
+        foreach ($attributes as $key => $value) {
+            $this->put($key, $value, reserved: false);
+        }
+
         $this->startUnixNano = $startUnixNano ?? (int) (microtime(true) * 1e9);
         $this->startMonotonic = hrtime(true);
         $this->links = $links;
@@ -124,9 +172,139 @@ final class Span
      */
     public function setAttribute(string $key, mixed $value): self
     {
+        return $this->put($key, $value, reserved: false);
+    }
+
+    /**
+     * @param  array-key  $key  an INT is legal here and arrives routinely:
+     *                          PHP turns a numeric string array key into
+     *                          an integer, so any `['0' => …]` an
+     *                          application passes to setAttributes(),
+     *                          addContext() or the constructor reaches
+     *                          this as an int. Declaring it `string` made
+     *                          that a TypeError out of `end()`, which is
+     *                          telemetry failing the application over an
+     *                          attribute name.
+     * @param  scalar|null  $value
+     */
+    private function put(string|int $key, mixed $value, bool $reserved): self
+    {
+        $key = (string) $key;
+
+        $limit = self::MAX_ATTRIBUTES + ($reserved ? self::RESERVE : 0);
+
+        if (! array_key_exists($key, $this->attributes) && count($this->attributes) >= $limit) {
+            $this->droppedAttributes++;
+
+            return $this;
+        }
+
+        // A per-span byte ceiling, refusing the attribute WHOLE.
+        //
+        // The tracer's budget covers the finished buffer, which is no
+        // help while a span is open — one span took sixty-four 1MiB
+        // attributes and held them until it ended. Truncating the value
+        // instead would cut a credential before redaction could read
+        // it, so the choice is to keep it or refuse it.
+        //
+        // An update credits the old value first, or a loop that
+        // rewrites one attribute would climb the ceiling and start
+        // refusing everything else.
+        $previous = array_key_exists($key, $this->attributes)
+            ? self::sizeOfEntry($key, $this->attributes[$key])
+            : 0;
+
+        $size = self::sizeOfEntry($key, $value);
+
+        if (! $reserved && $this->bytes - $previous + $size > self::MAX_BYTES) {
+            $this->droppedAttributes++;
+
+            return $this;
+        }
+
+        $this->bytes = $this->bytes - $previous + $size;
+
+        // No length limit on the value, deliberately. Cutting one
+        // before redaction sees it destroys the evidence redaction
+        // matches on: truncating
+        // `…https://alice:hunter2@example.test/` at the `@` leaves a
+        // string the userinfo pattern no longer recognises, and the
+        // password ships. Length is the redactor's to cap, after it
+        // has redacted.
         $this->attributes[$key] = $value;
 
         return $this;
+    }
+
+    /**
+     * Attributes this span refused, for OTLP's droppedAttributesCount —
+     * a reader must be able to tell a span that had five attributes
+     * from one that had five hundred.
+     */
+    public function droppedAttributes(): int
+    {
+        return $this->droppedAttributes;
+    }
+
+    public function droppedEvents(): int
+    {
+        return $this->droppedEvents;
+    }
+
+    /**
+     * Roughly how much memory this span's content occupies.
+     *
+     * Rough on purpose: the tracer's byte budget is a safety valve, not
+     * an accounting system, and an exact measurement would cost more
+     * than the thing it protects against. Keys and scalar values are
+     * counted flat, with a small constant for the per-attribute
+     * overhead PHP's arrays carry.
+     */
+    public function approximateBytes(): int
+    {
+        // Every key goes through strlen() as a STRING. PHP turns a
+        // numeric string array key into an int on the way in, so
+        // `setAttribute('0', 'v')` handed strlen() an integer and this
+        // method — reached from end(), outside any guard — threw into
+        // the application. In this package that is the one unforgivable
+        // bug, and a size estimate is the last place it should come
+        // from.
+        $bytes = strlen($this->name) + strlen((string) $this->statusDescription) + 128;
+
+        $bytes += $this->sizeOf($this->attributes);
+
+        foreach ($this->events as $event) {
+            $bytes += strlen($event->name) + 64 + $this->sizeOf($event->attributes);
+        }
+
+        foreach ($this->links as $link) {
+            $bytes += 96 + $this->sizeOf($link->attributes);
+        }
+
+        return $bytes;
+    }
+
+    /**
+     * @param  array<array-key, scalar|null>  $attributes
+     */
+    private function sizeOf(array $attributes): int
+    {
+        $bytes = 0;
+
+        foreach ($attributes as $key => $value) {
+            $bytes += self::sizeOfEntry($key, $value);
+        }
+
+        return $bytes;
+    }
+
+    /**
+     * @param  array-key  $key
+     * @param  scalar|null  $value
+     */
+    private static function sizeOfEntry(string|int $key, mixed $value): int
+    {
+        return strlen((string) $key) + (is_string($value) ? strlen($value) : 8) + 48;
     }
 
     /**
@@ -135,7 +313,7 @@ final class Span
     public function setAttributes(array $attributes): self
     {
         foreach ($attributes as $key => $value) {
-            $this->attributes[$key] = $value;
+            $this->put($key, $value, reserved: false);
         }
 
         return $this;
@@ -151,7 +329,10 @@ final class Span
      */
     public function forgetAttribute(string $key): self
     {
-        unset($this->attributes[$key]);
+        if (array_key_exists($key, $this->attributes)) {
+            $this->bytes -= self::sizeOfEntry($key, $this->attributes[$key]);
+            unset($this->attributes[$key]);
+        }
 
         return $this;
     }
@@ -165,7 +346,9 @@ final class Span
     public function mergeMissingAttributes(array $defaults): self
     {
         foreach ($defaults as $key => $value) {
-            $this->attributes[$key] ??= $value;
+            if (! isset($this->attributes[$key])) {
+                $this->put($key, $value, reserved: false);
+            }
         }
 
         return $this;
@@ -201,7 +384,33 @@ final class Span
      */
     public function addEvent(string $name, array $attributes = []): self
     {
-        $this->events[] = new SpanEvent($name, (int) (microtime(true) * 1e9), $attributes);
+        return $this->record($name, $attributes, reserved: false);
+    }
+
+    /**
+     * @param  array<string, scalar|null>  $attributes
+     */
+    private function record(string $name, array $attributes, bool $reserved): self
+    {
+        $limit = self::MAX_EVENTS + ($reserved ? self::RESERVE : 0);
+
+        if (count($this->events) >= $limit) {
+            $this->droppedEvents++;
+
+            return $this;
+        }
+
+        // An event's own attribute map is as unbounded as the span's
+        // was, and a hundred and twenty-eight events of it is the same
+        // problem multiplied.
+        $droppedAttributes = 0;
+
+        if (count($attributes) > self::MAX_ATTRIBUTES) {
+            $droppedAttributes = count($attributes) - self::MAX_ATTRIBUTES;
+            $attributes = array_slice($attributes, 0, self::MAX_ATTRIBUTES, preserve_keys: true);
+        }
+
+        $this->events[] = new SpanEvent($name, (int) (microtime(true) * 1e9), $attributes, $droppedAttributes);
 
         return $this;
     }
@@ -223,10 +432,15 @@ final class Span
 
         if ($this->recordedException !== $id) {
             $this->recordedException = $id;
-            $this->addEvent('exception', ExceptionAttributes::from($exception));
+            $this->record('exception', ExceptionAttributes::from($exception), reserved: true);
         }
 
         if ($fail) {
+            // semconv asks for `error.type` on anything that failed, and
+            // an attribute is the only form a backend can group or filter
+            // by — the exception event carries the same class name where
+            // only a human reading one span will find it.
+            $this->put('error.type', $exception::class, reserved: true);
             $this->setStatus(SpanStatus::Error, $exception->getMessage());
         }
 

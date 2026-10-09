@@ -34,6 +34,7 @@ Attached to every exported signal (OTel resource conventions).
 | `service.version` | `TELEMETRY_SERVICE_VERSION` | — |
 | `service.environment` | `TELEMETRY_SERVICE_ENVIRONMENT` | `APP_ENV` |
 | `service.deployment` | `TELEMETRY_SERVICE_DEPLOYMENT` | auto — explicit value wins; otherwise the current git sha is detected from `.git/HEAD` (no exec). Becomes `deployment.id` on every signal |
+| `service.instance_id` | `TELEMETRY_SERVICE_INSTANCE_ID` | auto, always set — explicit value wins, then `service.instance.id` from `OTEL_RESOURCE_ATTRIBUTES`; otherwise `host.name` when the metric store lives on this host (APCu, SQLite, array, Redis on loopback or a socket), or `redis-<fingerprint>` of a shared Redis (host, port, database and prefixes — never credentials), identical on every host. Prometheus's and Mimir's OTLP receivers derive `instance` from it |
 | `resource_detection` | `TELEMETRY_RESOURCE_DETECTION` | `true` — auto-detect container/k8s/cloud attributes (`container.id`, `k8s.pod.name`, `k8s.namespace.name`, `cloud.region`, …) from cgroup facts, downward-API env vars and `OTEL_RESOURCE_ATTRIBUTES`. Config `service.*` keys always win |
 | `self_metrics` | `TELEMETRY_SELF_METRICS` | `true` — emit the package's own health as metrics (`telemetry.export.*`, `telemetry.spool.depth`) |
 
@@ -171,6 +172,7 @@ pass `-H 'Accept: application/openmetrics-text'`.
 | `traces.sample_rate` | `TELEMETRY_TRACES_SAMPLE_RATE` | `1.0` |
 | `traces.max_buffer` | `TELEMETRY_TRACES_MAX_BUFFER` | `5000` |
 | `traces.continue_incoming` | `TELEMETRY_TRACES_CONTINUE_INCOMING` | `true` |
+| `traces.continue_incoming_parent` | `TELEMETRY_TRACES_CONTINUE_INCOMING_PARENT` | `true` — `false` adopts the incoming trace id but starts the request span as the root and links the incoming span id. For an edge that injects `traceparent` without exporting a span of its own |
 | `traces.trust_incoming_sampling` | `TELEMETRY_TRACES_TRUST_INCOMING_SAMPLING` | `true` — disable on public edges so clients can't force sampling |
 | `traces.always_sample_errors` | `TELEMETRY_TRACES_ALWAYS_SAMPLE_ERRORS` | `true` — error spans export even from unsampled traces |
 | `traces.share_context` | `TELEMETRY_TRACES_SHARE_CONTEXT` | `true` — publishes `trace_id` into Laravel `Context` (Sentry/Flare/logs pick it up) + a Sentry scope tag |
@@ -204,7 +206,16 @@ with the key `log.message`.
 
 | Key | Default |
 |---|---|
-| `default_buckets` | `[1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000]` (ms) |
+| `default_buckets` | `[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10]` (seconds) |
+
+The ladder tops out at **10 seconds**, which is right for a request and
+wrong for a job, a scheduled task or an artisan command — and the failure
+is silent. A classic histogram reports the highest finite boundary for
+anything past it, so a queue an hour behind answers `p95 = 10` and an
+alert set at 30 never fires. The package's own long-running instruments
+(`queue.job.wait_time`, `queue.job.duration`, `schedule.task.duration`,
+`command.duration`) therefore pass their own ladders; do the same for
+yours.
 
 ## Analytics (optional)
 
@@ -285,10 +296,15 @@ Only valid v3 source maps within the size limit are stored. See
 | `instrument.batches` | `TELEMETRY_INSTRUMENT_BATCHES` | `true` — `bus.batches{event,name}` job-batch lifecycle |
 | `instrument.redis` | `TELEMETRY_INSTRUMENT_REDIS` | `false` — Redis command spans (key only, never values) + `redis.commands` counter; telemetry's own connections auto-ignored |
 | `instrument.redis_ignore_connections` | — | `null` → auto (metric-store + spool connections); set a list to override |
+| `instrument.redis_failures` | `TELEMETRY_INSTRUMENT_REDIS_FAILURES` | `true` — `redis.commands.failed` counter + an errored client span per Redis command that raised. Separate from `redis` above: per-command spans profile Redis, failures tell you Redis is why everything else is failing. Costs one event dispatch per command (Laravel fires both events from one switch); opens no connection at boot |
+| `instrument.migrations` | `TELEMETRY_INSTRUMENT_MIGRATIONS` | `true` — `db.migration.duration` histogram + `db.migrations.started` / `db.migration.ran` / `db.migrations.finished` events. The most common answer to "what changed at 14:32", and the only way a migration holding a lock for four minutes is visible |
+| `instrument.maintenance_mode` | `TELEMETRY_INSTRUMENT_MAINTENANCE_MODE` | `true` — `app.maintenance_mode` events on both edges, so a planned window reads as a window and not an outage |
+| `instrument.connection_pool` | `TELEMETRY_INSTRUMENT_CONNECTION_POOL` | `true` — `db.connections.over_threshold` counter + event from Laravel's `DatabaseBusy` (the server's connection count crossed `db:monitor --max`; not a failed checkout). Separates "the database is slow" from "everyone is queuing to talk to it" |
 | `instrument.db_connect` | `TELEMETRY_INSTRUMENT_DB_CONNECT` | `true` — `db.connect` span per PDO handshake + `db.client.connection.create_time` histogram. Fires once per connection per request, not per query |
-| `instrument.redis_connect` | `TELEMETRY_INSTRUMENT_REDIS_CONNECT` | `true` — `redis.connect` span per Redis handshake; honours `redis_ignore_connections` and always skips telemetry's own store/spool |
+| `instrument.redis_connect` | `TELEMETRY_INSTRUMENT_REDIS_CONNECT` | `true` — `redis.connect` span per Redis handshake (phpredis and predis, including each Sentinel and master node predis connects to); honours `redis_ignore_connections` and always skips telemetry's own store/spool |
 | `instrument.user` | `TELEMETRY_INSTRUMENT_USER` | `true` — tag request spans with `user.id` + `user.type` (model) + `user.guard` (multi-guard safe; never PII) |
-| `instrument.resources` | `TELEMETRY_INSTRUMENT_RESOURCES` | `true` — peak memory + CPU per request/job/task; with cboxdk/system-metrics also real RSS + CPU utilization |
+| `instrument.resources` | `TELEMETRY_INSTRUMENT_RESOURCES` | `true` — peak memory + CPU per request/job/task, from PHP built-ins that cost nothing |
+| `instrument.resources_process` | `TELEMETRY_INSTRUMENT_RESOURCES_PROCESS` | unset → decide by platform. Adds real RSS + CPU utilization from cboxdk/system-metrics, which reads `/proc` on Linux (microseconds) and shells out to `ps` elsewhere (~28ms, twice per request). Taken only where it is cheap; set `true`/`false` to override |
 | `instrument.profiling` | `TELEMETRY_INSTRUMENT_PROFILING` | `true` — CPU profiling via cboxdk/telemetry-native, or ext-excimer as a fallback; a silent no-op without either. See [Profiling](#profiling) below |
 | `instrument.scheduled_tasks` | `TELEMETRY_INSTRUMENT_SCHEDULED_TASKS` | `true` — task spans + processed/failed/skipped counters |
 | `instrument.views` | `TELEMETRY_INSTRUMENT_VIEWS` | `true` — nested render spans per Blade/PHP view/partial/component (detail-marked); `view.render.count` tally on the root span |

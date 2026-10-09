@@ -13,6 +13,7 @@ use Cbox\Telemetry\Support\ResourceUsage;
 use Cbox\Telemetry\TelemetryManager;
 use Cbox\Telemetry\Tracing\Span;
 use Cbox\Telemetry\Tracing\SpanStatus;
+use Illuminate\Console\Events\ScheduledBackgroundTaskFinished;
 use Illuminate\Console\Events\ScheduledTaskFailed;
 use Illuminate\Console\Events\ScheduledTaskFinished;
 use Illuminate\Console\Events\ScheduledTaskSkipped;
@@ -57,6 +58,36 @@ final class ScheduleInstrumentation
         $events->listen(ScheduledTaskFinished::class, $this->taskFinished(...));
         $events->listen(ScheduledTaskFailed::class, $this->taskFailed(...));
         $events->listen(ScheduledTaskSkipped::class, $this->taskSkipped(...));
+
+        if (class_exists(ScheduledBackgroundTaskFinished::class)) {
+            $events->listen(ScheduledBackgroundTaskFinished::class, $this->backgroundTaskFinished(...));
+        }
+    }
+
+    /**
+     * A `runInBackground()` task, reported by the parent process when the
+     * child exits.
+     *
+     * The spans above skip these deliberately: the work happens in
+     * another process, so there is no duration here to measure and no
+     * context to attach it to. But whether it SUCCEEDED is knowable —
+     * it is the child's exit code — and until now a background task
+     * failing every night produced no signal at all. A counter, no
+     * invented timing.
+     */
+    private function backgroundTaskFinished(ScheduledBackgroundTaskFinished $event): void
+    {
+        FailSafe::guard(function () use ($event) {
+            $exit = $event->task->exitCode;
+            $outcome = $exit === null ? 'unknown' : ($exit === 0 ? 'processed' : 'failed');
+
+            $this->telemetry()
+                ->counter("schedule.background_tasks.{$outcome}", 'Background scheduled task runs by outcome')
+                ->inc(1, [
+                    'task' => $this->taskName($event->task),
+                    'schedule.task.exit_code' => (string) ($exit ?? 'unknown'),
+                ]);
+        });
     }
 
     private function taskStarting(ScheduledTaskStarting $event): void
@@ -100,7 +131,7 @@ final class ScheduleInstrumentation
 
     private function taskFinished(ScheduledTaskFinished $event): void
     {
-        $this->completeTask(spl_object_id($event->task), 'processed');
+        FailSafe::guard(fn () => $this->completeTask(spl_object_id($event->task), 'processed'));
     }
 
     private function taskFailed(ScheduledTaskFailed $event): void
@@ -124,7 +155,7 @@ final class ScheduleInstrumentation
                 ->inc(1, ['task' => $this->taskName($event->task)]);
         });
 
-        $this->telemetry()->flush();
+        FailSafe::guard(fn () => $this->telemetry()->flush());
     }
 
     private function completeTask(int $id, string $outcome): void
@@ -167,8 +198,11 @@ final class ScheduleInstrumentation
             $span->end();
 
             $this->telemetry()
-                ->histogram('schedule.task.duration', description: 'Scheduled task run duration', unit: 'ms')
-                ->record($span->durationMs(), $labels);
+                // A scheduled task runs for minutes as a matter of course; the
+                // default ladder tops out at ten seconds and would report
+                // every one of them as exactly that.
+                ->histogram('schedule.task.duration', buckets: [0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60, 300, 600, 1800], description: 'Scheduled task run duration', unit: 's')
+                ->record($span->durationMs() / 1000, $labels);
 
             $this->telemetry()
                 ->counter("schedule.tasks.{$outcome}", 'Scheduled task runs by outcome')
@@ -187,8 +221,12 @@ final class ScheduleInstrumentation
 
         // Isolate each task: flush its telemetry and clear trace context
         // before the next task runs in the same process.
-        $this->telemetry()->flush();
-        $this->telemetry()->resetContext();
+        //
+        // Guarded, because `schedule:run` runs every task in ONE
+        // process: a throw here does not cost this task's telemetry,
+        // it costs every task after it in tonight's run.
+        FailSafe::guard(fn () => $this->telemetry()->flush());
+        FailSafe::guard(fn () => $this->telemetry()->resetContext());
     }
 
     /**

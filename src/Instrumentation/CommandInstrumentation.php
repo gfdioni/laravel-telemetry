@@ -117,19 +117,27 @@ final class CommandInstrumentation implements ManagesRequestState
             $labels = ['command' => $event->command ?? 'unknown'];
 
             $this->telemetry()
-                ->histogram('command.duration', description: 'Artisan command duration', unit: 'ms')
-                ->record($span->durationMs(), $labels);
+                // An artisan command is allowed to take half an hour. The default
+                // ladder stops at ten seconds, and a classic histogram
+                // reports the highest finite bound for anything past it.
+                ->histogram('command.duration', buckets: [0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60, 300, 600, 1800], description: 'Artisan command duration', unit: 's')
+                ->record($span->durationMs() / 1000, $labels);
 
             $this->telemetry()
                 ->counter($event->exitCode === 0 ? 'commands.completed' : 'commands.failed', 'Artisan command runs by outcome')
                 ->inc(1, $labels);
         });
 
-        $unit?->discard();
+        // Teardown is guarded too. A command that finished must not
+        // fail on the way out because telemetry could not be flushed —
+        // the exit code is what a scheduler reads.
+        FailSafe::guard(static fn () => $unit?->discard());
 
         if ($this->stack === []) {
-            $this->telemetry()->flush();
-            $this->telemetry()->resetContext();
+            FailSafe::guard(function (): void {
+                $this->telemetry()->flush();
+                $this->telemetry()->resetContext();
+            });
         }
     }
 

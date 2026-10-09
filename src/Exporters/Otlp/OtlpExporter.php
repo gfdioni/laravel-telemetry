@@ -6,6 +6,7 @@ namespace Cbox\Telemetry\Exporters\Otlp;
 
 use Cbox\Telemetry\Contracts\Exporter;
 use Cbox\Telemetry\Support\ExportResult;
+use Cbox\Telemetry\Support\SharedState;
 use Cbox\Telemetry\Support\SignalSet;
 use Cbox\Telemetry\Support\TelemetryBatch;
 
@@ -21,11 +22,16 @@ final class OtlpExporter implements Exporter
 {
     /**
      * Circuit breaker: after a retryable failure, exports are skipped
-     * until this timestamp. Static so it survives across requests within
-     * a long-lived FPM/Octane worker — a dead collector costs each worker
-     * one timeout, not one per request.
+     * until a deadline held in SharedState, so a dead collector costs
+     * the pool one timeout per cooldown window rather than one timeout
+     * per request. A plain static would be reset by PHP-FPM between
+     * requests, which is precisely the case the breaker exists for.
+     *
+     * One key, not one per endpoint: the state is shared by the workers
+     * of a pool, and a pool runs one application with one configured
+     * endpoint.
      */
-    private static int $openUntil = 0;
+    private const CIRCUIT_KEY = 'otlp:circuit';
 
     private const DEFAULT_COOLDOWN_SECONDS = 30;
 
@@ -50,30 +56,58 @@ final class OtlpExporter implements Exporter
      */
     public static function circuitOpen(): bool
     {
-        return time() < self::$openUntil;
+        return time() < SharedState::deadline(self::CIRCUIT_KEY);
     }
 
     public function export(TelemetryBatch $batch): ExportResult
     {
-        if (time() < self::$openUntil) {
+        if (self::circuitOpen()) {
             return ExportResult::retryable('circuit open — recent transport failure');
         }
 
         $results = [];
 
-        if ($batch->spans !== []) {
-            $results[] = $this->transport->post('/v1/traces', $this->serializer->traces($batch->spans));
-        }
+        foreach ($this->requests($batch) as [$path, $payload]) {
+            $result = $this->transport->post($path, $payload);
+            $results[] = $result;
 
-        if ($batch->metrics !== []) {
-            $results[] = $this->transport->post('/v1/metrics', $this->serializer->metrics($batch->metrics));
-        }
-
-        if ($batch->events !== []) {
-            $results[] = $this->transport->post('/v1/logs', $this->serializer->logs($batch->events));
+            // Stop only when the collector could not be REACHED. A
+            // batch carries up to three signals to one endpoint, and
+            // paying its connect timeout once per signal is what this
+            // avoids. A 429 or a 503 is not that: it came back from a
+            // server that answered, the next signal may well be
+            // accepted, and skipping it drops data the manager has
+            // already handed over and cleared.
+            if ($result->unreachable) {
+                break;
+            }
         }
 
         return $this->combine($results);
+    }
+
+    /**
+     * The signals in a batch, in the order they are posted.
+     *
+     * @return list<array{0: string, 1: array<string, mixed>}>
+     */
+    private function requests(TelemetryBatch $batch): array
+    {
+        $requests = [];
+
+        if ($batch->spans !== []) {
+            $requests[] = ['/v1/traces', $this->serializer->traces($batch->spans)];
+        }
+
+        if ($batch->metrics !== []) {
+            $requests[] = ['/v1/metrics', $this->serializer->metrics($batch->metrics)];
+        }
+
+        if ($batch->events !== []) {
+            $requests[] = ['/v1/logs', $this->serializer->logs($batch->events)];
+        }
+
+        return $requests;
     }
 
     /**
@@ -85,20 +119,67 @@ final class OtlpExporter implements Exporter
             return ExportResult::ok();
         }
 
-        foreach ($results as $result) {
-            if (! $result->success) {
-                if ($result->retryable) {
-                    self::$openUntil = time() + ($result->retryAfterSeconds ?? self::DEFAULT_COOLDOWN_SECONDS);
-                }
+        // The breaker is decided across ALL the results, before any of
+        // them is returned. Returning at the first failure meant a 400
+        // on traces followed by a timeout on logs left the circuit
+        // shut — the exporter had just proved the collector
+        // unreachable and then forgot — and a one-second Retry-After
+        // followed by an hour's took the one second.
+        $cooldown = 0;
 
-                return $result;
+        foreach ($results as $result) {
+            if (! $result->success && $result->retryable) {
+                $cooldown = max($cooldown, $result->retryAfterSeconds ?? self::DEFAULT_COOLDOWN_SECONDS);
+            }
+        }
+
+        if ($cooldown > 0) {
+            SharedState::remember(self::CIRCUIT_KEY, time() + $cooldown);
+        }
+
+        // A mixed batch: one signal failed and another was accepted
+        // with rejections. The failure is what the caller must act on —
+        // it decides the retry — but the rejections are real data loss
+        // and were disappearing with the result that carried them.
+        $rejected = 0;
+        $reasons = [];
+
+        foreach ($results as $result) {
+            $rejected += $result->rejected;
+
+            if ($result->reason !== null) {
+                $reasons[] = $result->reason;
             }
         }
 
         foreach ($results as $result) {
-            if ($result->rejected > 0) {
+            if ($result->success) {
+                continue;
+            }
+
+            if ($rejected <= $result->rejected) {
                 return $result;
             }
+
+            $reason = implode('; ', $reasons)." (and {$rejected} data points rejected by another signal)";
+
+            return match (true) {
+                $result->unreachable => ExportResult::unreachable($reason, $result->retryAfterSeconds),
+                $result->retryable => ExportResult::retryable($reason, $result->retryAfterSeconds),
+                default => ExportResult::failed($reason),
+            };
+        }
+
+        // A rejection, or a response we could not read — either way
+        // the batch was accepted but something about it is unknown,
+        // and both have to survive the fold. Reporting a clean success
+        // here is how a partial loss goes unnoticed.
+        //
+        // Summed and joined across signals: traces rejecting three and
+        // logs rejecting seven is ten, not three, and the operator
+        // needs both reasons.
+        if ($rejected > 0 || $reasons !== []) {
+            return ExportResult::partial($rejected, $reasons === [] ? null : implode('; ', $reasons));
         }
 
         return ExportResult::ok();
@@ -109,6 +190,6 @@ final class OtlpExporter implements Exporter
      */
     public static function resetCircuit(): void
     {
-        self::$openUntil = 0;
+        SharedState::forget(self::CIRCUIT_KEY);
     }
 }

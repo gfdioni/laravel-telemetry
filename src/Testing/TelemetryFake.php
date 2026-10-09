@@ -29,6 +29,17 @@ use PHPUnit\Framework\Assert;
  * for attributes production really does emit. Turn it off — to model
  * `instrument.resources => false` — with
  * `$fake->tracer()->measureSpanResources(false)`.
+ *
+ * REDACTION DOES NOT RUN HERE. The redaction engine is the last thing
+ * that touches a batch before an exporter sees it, and this double
+ * collects spans in place of exporting them — so what the assertions
+ * below show you is what was RECORDED, not what would be SENT. A test
+ * asserting that a secret was redacted will therefore pass whether or
+ * not the engine would have caught it, which is the worst possible
+ * outcome for that particular test.
+ *
+ * To assert redaction, use a real manager with a CollectingExporter and
+ * flush it: `tests/FailSafety/OutgoingUrlRedactionTest.php` does this.
  */
 final class TelemetryFake extends TelemetryManager
 {
@@ -37,7 +48,7 @@ final class TelemetryFake extends TelemetryManager
     /**
      * @param  list<float>  $defaultBuckets
      */
-    public function __construct(array $defaultBuckets = [1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000])
+    public function __construct(array $defaultBuckets = [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10])
     {
         $store = new ArrayMetricStore;
         $tracer = new Tracer(sampleRate: 1.0);
@@ -113,6 +124,14 @@ final class TelemetryFake extends TelemetryManager
         }
     }
 
+    public function assertGaugeNotSet(string $name): void
+    {
+        Assert::assertEmpty(
+            $this->samples($name, MetricType::Gauge),
+            "Gauge [{$name}] was unexpectedly set.",
+        );
+    }
+
     /**
      * @param  array<string, scalar|null>  $labels
      */
@@ -140,6 +159,14 @@ final class TelemetryFake extends TelemetryManager
         }
     }
 
+    public function assertHistogramNotRecorded(string $name): void
+    {
+        Assert::assertEmpty(
+            $this->samples($name, MetricType::Histogram),
+            "Histogram [{$name}] unexpectedly recorded a value.",
+        );
+    }
+
     /**
      * @param  array<string, scalar|null>  $labels
      */
@@ -148,6 +175,22 @@ final class TelemetryFake extends TelemetryManager
         $sample = $this->matchSample($this->samples($name, MetricType::Histogram), $labels);
 
         return $sample instanceof HistogramSample ? $sample->count : 0;
+    }
+
+    /**
+     * The total of everything recorded into a histogram series.
+     *
+     * `histogramCount()` answers how many observations there were;
+     * this answers what they added up to, which is what a test asserting
+     * a converted or derived value actually needs.
+     *
+     * @param  array<string, scalar|null>  $labels
+     */
+    public function histogramSum(string $name, array $labels = []): float
+    {
+        $sample = $this->matchSample($this->samples($name, MetricType::Histogram), $labels);
+
+        return $sample instanceof HistogramSample ? $sample->sum : 0.0;
     }
 
     /**

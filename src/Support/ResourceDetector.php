@@ -49,6 +49,7 @@ final class ResourceDetector
         self::$cache ??= FailSafe::guard(static function (): array {
             $attributes = [];
 
+            self::mergeHost($attributes);
             self::mergeContainer($attributes);
             self::mergeEnvConventions($attributes);
             self::mergeFaas($attributes);
@@ -74,6 +75,51 @@ final class ResourceDetector
     {
         self::$cache = null;
         self::$coldStart = true;
+    }
+
+    /**
+     * The machine this process is running on.
+     *
+     * Without `host.name` on the resource there is no way to tie a request
+     * to the box that served it, so anything reading the host's own
+     * exporters — node_exporter, a health endpoint — has nothing to join
+     * on. Container, Kubernetes and cloud identity were already detected;
+     * a plain VM or bare-metal host had nothing at all, which is the most
+     * common self-hosted deployment there is.
+     *
+     * Inside a container the hostname is the container (in Kubernetes, the
+     * pod, which is also recorded as `k8s.pod.name`). That is the right
+     * answer from the process's point of view, and an operator whose node
+     * name differs overrides it through `OTEL_RESOURCE_ATTRIBUTES`, which
+     * is merged last and wins.
+     *
+     * @param  array<string, string>  $attributes
+     */
+    private static function mergeHost(array &$attributes): void
+    {
+        $hostname = gethostname();
+
+        if (is_string($hostname) && trim($hostname) !== '') {
+            $attributes['host.name'] = trim($hostname);
+        }
+
+        $arch = php_uname('m');
+
+        if (trim($arch) !== '') {
+            // OTel spells these its own way, not the kernel's. The
+            // 32-bit spellings matter less often and cost nothing to get
+            // right; anything unrecognised passes through, because an
+            // honest unknown beats a wrong category.
+            $attributes['host.arch'] = match (true) {
+                $arch === 'x86_64', $arch === 'amd64' => 'amd64',
+                $arch === 'aarch64', $arch === 'arm64' => 'arm64',
+                $arch === 'i386', $arch === 'i486', $arch === 'i586', $arch === 'i686' => 'x86',
+                str_starts_with($arch, 'armv'), $arch === 'arm' => 'arm32',
+                $arch === 'ppc64le', $arch === 'ppc64' => 'ppc64',
+                $arch === 's390x' => 's390x',
+                default => $arch,
+            };
+        }
     }
 
     /**

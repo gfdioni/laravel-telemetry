@@ -95,7 +95,7 @@ key stays on the span). Whole stores can be excluded with
 ## Outgoing host classification — `classifyHttpHostsUsing()`
 
 `server.address` is a **metric** label on `http.client.request.duration`
-and `http.client.connection_failures`. That is safe while every outbound
+and `http.client.connection.duration`. That is safe while every outbound
 host is one your app chose. It stops being safe the moment a host comes
 from a user — an OAuth issuer pasted into a form, a customer webhook, a
 tenant's own API — because each distinct hostname then becomes a
@@ -112,6 +112,113 @@ The returned group replaces `server.address` on the **metrics only** —
 spans keep the real hostname, because per-occurrence it costs nothing and
 it is what you need when reading a trace. Return `null` to drop the
 metrics for that host entirely while still recording the span.
+
+## Redaction — config, or your own class
+
+Two halves, because a name list is enough for context you set yourself
+and is not enough for auto-instrumentation.
+
+**Names.** `redaction.keys` covers attribute keys; query parameters are
+matched by name too, through every spelling the same parameter takes —
+`api_key`, `apiKey`, `x-api-key`, `%61pi_key`, `token[0]`.
+
+**Values.** The URLs this package records are not yours. They belong to
+whatever third-party API the application calls, and no list enumerates
+`?t=`, `?sas=`, or whatever the next vendor names its token. So a query
+parameter whose NAME said nothing is judged by its VALUE:
+
+```php
+'credential_prefixes' => Redactor::defaultCredentialPrefixes(), // sk_live_, ghp_, AKIA, …
+'value_shape' => true,        // 24+ chars, token alphabet, mixed case + digits
+'value_min_length' => 24,
+```
+
+UUIDs are excluded by shape — a UUID in a URL is an id somebody needs to
+read — and so is anything with a space or a character no token generator
+emits. Over-redaction is its own failure: an operator who cannot read
+the URLs stops trusting the tool.
+
+**Personal identifiers — optional, and off.** A separate layer for the
+structured ones, found in free text:
+
+```php
+'pii' => true,                              // email, credit_card, iban, us_ssn, dk_cpr
+'pii' => ['detectors' => ['email', 'ip']],  // exactly these
+```
+
+It catches what leaked in by accident — an email in an exception
+message, a card number in a SQL string, a CPR in a URL path — which is
+how personal data actually reaches an observability pipeline. Nobody
+decides to put it there.
+
+Every detector that can be checksummed is: Luhn for cards, mod-97 for
+IBANs, the unissued ranges excluded for SSNs. Without that a sixteen-
+digit number is a card far more often than it is an order id, and the
+first person to see a primary key redacted switches the whole thing off
+— which is worse than never having shipped it. `ip` and `phone` are not
+in the defaults: an IP is also how you find the one host that is broken,
+and a bare national phone number is indistinguishable from an order id.
+
+It costs about 2µs a span on top of the redaction pass.
+
+**It is a control, not compliance.** No configuration of it makes an
+application GDPR-, HIPAA- or SOC 2-compliant. Those are organisational,
+and most of what they cover cannot be pattern-matched: HIPAA names
+eighteen identifiers and this sees six, because a person's name, their
+address and a medical record number have no form to recognise. Those
+need the key rules above, and the discipline not to put them in a span.
+
+**Or replace the model.** `RedactsTelemetry` is a contract, for an
+organisation whose redaction policy is its own — a compliance list, a
+shared internal package, a scanner that already exists elsewhere:
+
+```php
+$this->app->bind(RedactsTelemetry::class, AcmeRedactor::class);
+```
+
+Bind it and the whole pipeline uses it. Reach for this when you need a
+different model, not a different list.
+
+## Queue name classification — `classifyQueuesUsing()`
+
+`queue` is a metric label on every queue metric this package emits, and
+Laravel lets you name a queue at dispatch time. `->onQueue("tenant-{$id}")`
+is an ordinary thing to write and a permanent series per tenant across
+half a dozen metrics, several of them histograms. On a platform with
+thousands of tenants that is not a slow dashboard; it is the metrics
+backend falling over.
+
+```php
+Telemetry::classifyQueuesUsing(fn (string $queue) =>
+    str_starts_with($queue, 'tenant-') ? 'tenant' : $queue);
+```
+
+The group replaces `queue` on the **metrics only** — spans keep the real
+name, which is what you want when reading one trace.
+
+Unlike the host classifier this one cannot drop a series: returning
+`null` collapses the queue to `other`. Dropping an outgoing host is
+reasonable, because you may genuinely not care about a customer's webhook
+endpoint. Dropping a queue would silently remove work the application
+actually did from its own throughput numbers.
+
+## Job name classification — `classifyJobsUsing()`
+
+`job.name` is a metric label on the queue metrics, and it comes from the
+payload's `displayName` — which Laravel lets a job set for itself. A
+job class name is bounded by your code and needs nothing here. A
+display name built at dispatch time is bounded only by your own
+discipline, and `"SyncTenant tenant-4812"` is one permanent series per
+tenant.
+
+```php
+Telemetry::classifyJobsUsing(fn (string $job) => Str::before($job, ' '));
+```
+
+Like the queue classifier, it cannot drop a series: returning `null`
+collapses the job to `other`, because work the application actually did
+should not vanish from its own throughput numbers. Spans keep the real
+name.
 
 ## Analytics session id — `resolveSessionUsing()`
 
@@ -178,6 +285,8 @@ Telemetry::resolveClientGeoUsing(function ($request) {
 | `resolveUserUsing()` | user attribution | `fn ($user, ?string $guard): array` |
 | `classifyCacheKeysUsing()` | cache grouping/dropping | `fn (string $store, string $key): ?string` |
 | `classifyHttpHostsUsing()` | outgoing-host metric label (bounded!) | `fn (string $host): ?string` |
+| `classifyQueuesUsing()` | queue metric label (bounded!) | `fn (string $queue): ?string` |
+| `classifyJobsUsing()` | job metric label (bounded!) | `fn (string $job): ?string` |
 | `redactUsing()` | last-pass redaction | `fn (string $key, string $value): ?string` |
 | `handleExceptionsUsing()` | internal-failure reporting | `fn (Throwable $e): void` |
 | `Telemetry::context()` | ambient dimensions on all signals | — |

@@ -1,0 +1,71 @@
+# The rig the numbers in docs/production/performance.md should come
+# from: the production PHP base image — php-fpm and nginx, opcache on,
+# the cbox_telemetry extension available — plus a real Redis for the
+# metric store and a real OTLP collector to post to.
+#
+#   docker compose -f loadtest/docker-compose.yml up -d --build
+#   loadtest/run.sh --target fpm redis otlp
+#
+# Rebuild with NATIVE=on (or auto) to measure what the native profiler
+# costs:
+#
+#   NATIVE=on docker compose -f loadtest/docker-compose.yml up -d --build
+#
+# Everything else about the package is set by environment on `app`, so
+# a run changes one variable and nothing else.
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: loadtest/Dockerfile
+      args:
+        NATIVE: "${NATIVE:-off}"
+        # The PRODUCTION tag, not -dev. The dev tag ships xdebug with
+        # `xdebug.mode=develop,debug,coverage` — active, not off — which
+        # costs every function call and therefore costs the telemetry
+        # path far more than the baseline it is being compared against.
+        # It inflated the measured per-request overhead 4x, from 0.45ms
+        # to 1.79ms, and the rig reported the inflated figure as the
+        # package's cost. The native extension is staged in both tags,
+        # so -dev bought nothing else.
+        PHP_IMAGE: "${PHP_IMAGE:-ghcr.io/cboxdk/php-baseimages/php-fpm-nginx:8.5-bookworm}"
+    ports: ["8931:80"]
+    environment:
+      NGINX_WEBROOT: /app/loadtest/public
+      TELEMETRY_ENABLED: "${TELEMETRY_ENABLED:-1}"
+      TELEMETRY_STORE: "${TELEMETRY_STORE:-array}"
+      TELEMETRY_EXPORTERS: "${TELEMETRY_EXPORTERS:-}"
+      # Overridable so the stalling `tarpit` below can be substituted for
+      # the real collector. Hardcoded, it silently ignored the override
+      # and the stall test measured a healthy collector.
+      TELEMETRY_OTLP_ENDPOINT: "${TELEMETRY_OTLP_ENDPOINT:-http://collector:4318}"
+      TELEMETRY_OTLP_SPOOL: "${TELEMETRY_OTLP_SPOOL:-0}"
+      TELEMETRY_TRACES_SAMPLE_RATE: "${TELEMETRY_TRACES_SAMPLE_RATE:-1.0}"
+      REDIS_HOST: redis
+    depends_on: [redis, collector]
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+
+  # A collector that ACCEPTS and then says nothing, which is the failure
+  # mode worth fearing. A refused connection is cheap — it comes back
+  # immediately and trips the breaker. One that holds the socket open
+  # holds an FPM worker for the whole HTTP timeout, and with the spool
+  # off that is paid on the request path.
+  #
+  #   TELEMETRY_OTLP_ENDPOINT=http://tarpit:4318 \
+  #     docker compose -f loadtest/docker-compose.yml up -d --no-deps app
+  tarpit:
+    image: alpine/socat:latest
+    command: ["-T", "300", "TCP-LISTEN:4318,fork,reuseaddr", "SYSTEM:'sleep 300'"]
+
+  # A real collector, so the export path is a real HTTP round trip
+  # rather than a fake. It throws the data away on purpose: this rig
+  # measures what it costs the APPLICATION to ship telemetry, not what
+  # it costs a backend to store it.
+  collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otel.yaml"]
+    volumes:
+      - ./otel-collector.yaml:/etc/otel.yaml:ro

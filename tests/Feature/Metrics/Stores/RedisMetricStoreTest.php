@@ -9,8 +9,12 @@ use Cbox\Telemetry\Metrics\MetricDefinition;
 use Cbox\Telemetry\Metrics\MetricType;
 use Cbox\Telemetry\Metrics\Stores\BufferedMetricStore;
 use Cbox\Telemetry\Metrics\Stores\RedisMetricStore;
+use Cbox\Telemetry\Support\SharedState;
 use Cbox\Telemetry\Testing\CollectingExporter;
+use Cbox\Telemetry\Tests\Doubles\PoolMemory;
 use Illuminate\Contracts\Redis\Factory;
+use Illuminate\Redis\Events\CommandExecuted;
+use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Redis;
 
 uses()->group('redis');
@@ -28,9 +32,16 @@ beforeEach(function () {
 
     $this->prefix = 'telemetry_test_'.bin2hex(random_bytes(4));
     $this->store = new RedisMetricStore(app(Factory::class), 'default', $this->prefix);
+
+    // The store's bookkeeping memo lives in shared memory, so the test
+    // needs a handle on it — and a clean one per test.
+    $this->pool = new PoolMemory;
+    SharedState::use($this->pool);
 });
 
 afterEach(function () {
+    SharedState::use(null);
+
     // wipe() deliberately preserves meta + indexes — tests must delete the
     // whole prefix so no keys leak into the local Redis between runs.
     if (isset($this->prefix)) {
@@ -270,9 +281,9 @@ it('re-creates its bookkeeping after the keys are lost underneath it', function 
     // Age the memo past its trust window — NOT clear it. Clearing would also
     // "pass" against a memo that is merely a boolean, which is the thing being
     // fixed: the old memo said done forever, so the window is the whole point.
-    (function () {
-        $this->initialized['counter:orders.created'] = time() - 3600;
-    })->call($this->store);
+    // Written straight into the shared memory, past-dated, which a caller
+    // going through SharedState::remember() could not do.
+    $this->pool->expireAll();
 
     $this->store->incrementCounter($definition, ['tenant' => 'acme'], 1.0);
 
@@ -281,3 +292,129 @@ it('re-creates its bookkeeping after the keys are lost underneath it', function 
     expect($families)->not->toBeEmpty()
         ->and($families[0]->name())->toBe('orders.created');
 })->group('redis');
+
+it('writes a histogram observation as one atomic command', function () {
+    // Bucket, sum and count were three round trips, and a failure
+    // between them left a series whose buckets outnumber its count —
+    // a number nobody can reason about afterwards.
+    $definition = new MetricDefinition('http.server.request.duration', MetricType::Histogram, buckets: [0.1, 0.5, 1.0]);
+
+    // Warm the bookkeeping so the observation is measured on its own.
+    $this->store->recordHistogram($definition, ['route' => '/orders'], 0.2);
+
+    $commands = [];
+    app(Factory::class)->enableEvents();
+    Event::listen(CommandExecuted::class, function (CommandExecuted $event) use (&$commands): void {
+        $commands[] = $event->command;
+    });
+
+    $this->store->recordHistogram($definition, ['route' => '/orders'], 0.2);
+
+    expect($commands)->toBe(['eval']);
+
+    $family = collect($this->store->collect())->firstWhere(fn ($f) => $f->name() === 'http.server.request.duration');
+    $sample = $family->samples[0];
+
+    expect($sample->count)->toBe(2)
+        ->and($sample->sum)->toBe(0.4)
+        ->and(array_sum($sample->bucketCounts))->toBe(2);
+});
+
+it('does not re-register a metric it already registered this window', function () {
+    // Under FPM the per-process memo was the request's, so every
+    // request rewrote the bookkeeping of every metric it touched.
+    $definition = new MetricDefinition('orders.created', MetricType::Counter);
+
+    $this->store->incrementCounter($definition, ['tenant' => 'acme'], 1.0);
+
+    $commands = [];
+    app(Factory::class)->enableEvents();
+    Event::listen(CommandExecuted::class, function (CommandExecuted $event) use (&$commands): void {
+        $commands[] = $event->command;
+    });
+
+    // A different process, the same pool.
+    (new RedisMetricStore(app(Factory::class), 'default', $this->prefix))
+        ->incrementCounter($definition, ['tenant' => 'acme'], 1.0);
+
+    expect($commands)->toBe(['eval']);
+});
+
+it('stops a runaway label from growing the family without bound', function () {
+    // The last line of defence. Every label this package produces is
+    // classified or bounded at its source, but an application declares
+    // its own metrics too, and a label built from a user id is the
+    // oldest mistake in the book. The budget lives in the script
+    // because the series already stored live in Redis: no process can
+    // count them on its own, and under FPM a per-process tally is a
+    // per-request one.
+    $store = new RedisMetricStore(app(Factory::class), 'default', $this->prefix, maxFields: 20);
+    $definition = new MetricDefinition('orders.created', MetricType::Counter);
+
+    for ($i = 0; $i < 200; $i++) {
+        $store->incrementCounter($definition, ['user' => (string) $i], 1.0);
+    }
+
+    $fields = app(Factory::class)->connection()->hgetall("{$this->prefix}:counter:orders.created");
+    $family = collect($store->collect())->firstWhere(fn ($f) => $f->name() === 'orders.created');
+
+    expect(count($family->samples))->toBeLessThan(25)
+        // And it says so, rather than leaving an operator to wonder
+        // where the rest went.
+        ->and((int) ($fields['__overflow'] ?? 0))->toBeGreaterThan(150);
+});
+
+it('keeps counting a series it already has after the budget is reached', function () {
+    // Refusing NEW series must not stop the existing ones. The metrics
+    // that were already there are the ones the dashboards are built on.
+    $store = new RedisMetricStore(app(Factory::class), 'default', $this->prefix, maxFields: 5);
+    $definition = new MetricDefinition('orders.created', MetricType::Counter);
+
+    $store->incrementCounter($definition, ['tenant' => 'acme'], 1.0);
+
+    for ($i = 0; $i < 50; $i++) {
+        $store->incrementCounter($definition, ['tenant' => "t{$i}"], 1.0);
+    }
+
+    $store->incrementCounter($definition, ['tenant' => 'acme'], 1.0);
+
+    $family = collect($store->collect())->firstWhere(fn ($f) => $f->name() === 'orders.created');
+    $acme = collect($family->samples)->first(fn ($sample) => ($sample->labels['tenant'] ?? null) === 'acme');
+
+    expect($acme->value)->toBe(2.0);
+});
+
+it('refuses a whole observation at the budget, never half of one', function () {
+    // Deciding the budget per FIELD let a histogram land its sum and
+    // count while its bucket was refused: buckets adding to 1 under a
+    // count of 2, which is not a number anyone can read. The budget is
+    // decided for the observation.
+    $store = new RedisMetricStore(app(Factory::class), 'default', $this->prefix, maxFields: 5);
+    $definition = new MetricDefinition('http.server.request.duration', MetricType::Histogram, buckets: [10, 100]);
+
+    $store->recordHistogram($definition, ['route' => '/a'], 5);
+    $store->recordHistogram($definition, ['route' => '/a'], 50);
+
+    $family = collect($store->collect())->firstWhere(fn ($f) => $f->name() === 'http.server.request.duration');
+    $sample = $family->samples[0];
+
+    expect(array_sum($sample->bucketCounts))->toBe($sample->count);
+});
+
+it('refuses a non-finite observation instead of half-writing one', function () {
+    // Redis refuses to increment a sum by NAN, and the bucket has
+    // already been counted by then: buckets outnumbering the count,
+    // from arithmetic that belongs to the application.
+    $definition = new MetricDefinition('http.server.request.duration', MetricType::Histogram, buckets: [10, 100]);
+
+    $this->store->recordHistogram($definition, ['route' => '/a'], 5);
+    $this->store->recordHistogram($definition, ['route' => '/a'], NAN);
+    $this->store->recordHistogram($definition, ['route' => '/a'], INF);
+
+    $family = collect($this->store->collect())->firstWhere(fn ($f) => $f->name() === 'http.server.request.duration');
+    $sample = $family->samples[0];
+
+    expect($sample->count)->toBe(1)
+        ->and(array_sum($sample->bucketCounts))->toBe(1)
+        ->and(is_finite($sample->sum))->toBeTrue();
+});

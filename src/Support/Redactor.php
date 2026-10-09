@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Cbox\Telemetry\Support;
 
+use Cbox\Telemetry\Contracts\RedactsTelemetry;
 use Cbox\Telemetry\Events\TelemetryEvent;
 use Cbox\Telemetry\Tracing\Span;
 use Cbox\Telemetry\Tracing\SpanEvent;
@@ -29,14 +30,18 @@ use Closure;
  * A broken custom pattern never breaks telemetry: patterns that fail to
  * compile are skipped, and the hook is guarded.
  */
-final class Redactor
+final class Redactor implements RedactsTelemetry
 {
     private ?Closure $custom = null;
+
+    private ?string $prefixPattern = null;
 
     /**
      * @param  list<string>  $keys
      * @param  array<string, string>  $patterns  regex => replacement
      * @param  list<string>  $safeKeys
+     * @param  list<string>  $credentialPrefixes
+     * @param  list<string>  $personalData
      */
     public function __construct(
         private readonly bool $enabled = true,
@@ -46,6 +51,16 @@ final class Redactor
         private readonly array $safeKeys = [],
         /** Whether the app took the lists over, which also turns off the built-in name heuristics. */
         private readonly bool $replaceDefaults = false,
+        /** Issuer prefixes that mark a value as a credential whatever it was called. */
+        private readonly array $credentialPrefixes = [],
+        /** Whether to judge a value by its shape when its name says nothing. */
+        private readonly bool $valueShape = true,
+        /** How long an unrecognised value must be before its shape is evidence. */
+        private readonly int $valueMinLength = 24,
+        /** Structured personal identifiers to scrub out of free text. Empty = off. */
+        private readonly array $personalData = [],
+        /** Longest attribute value that reaches an exporter. 0 disables the cap. */
+        private readonly int $maxValueLength = 4096,
     ) {}
 
     /**
@@ -87,6 +102,26 @@ final class Redactor
             // unioning an exemption is not.
             safeKeys: $safeKeys ?? self::defaultSafeKeys(),
             replaceDefaults: $replace,
+            // Unioned like the other RULES, for the same reason: a new
+            // issuer prefix added in a later version must reach an app
+            // that published its config two versions ago.
+            credentialPrefixes: self::union(
+                self::defaultCredentialPrefixes(),
+                self::stringList($config['credential_prefixes'] ?? null),
+                $replace,
+            ),
+            valueShape: (bool) ($config['value_shape'] ?? true),
+            valueMinLength: is_numeric($config['value_min_length'] ?? null)
+                ? max(8, (int) $config['value_min_length'])
+                : 24,
+            // Off unless asked for. It is a real cost per value and a
+            // real risk of removing something an operator needed, so it
+            // is a decision an organisation makes rather than one made
+            // for them.
+            personalData: self::personalDataFromConfig($config),
+            maxValueLength: is_numeric($config['max_value_length'] ?? null)
+                ? max(0, (int) $config['max_value_length'])
+                : 4096,
         );
     }
 
@@ -167,7 +202,13 @@ final class Redactor
                 $separator = $m[1][0];
                 $ambiguous = $separator === '?' || $separator === '&' || $separator === ';';
 
-                if (! self::parameterIsCredential($m[2][0], $ambiguous)) {
+                // The name first, because it is cheap and certain. Then
+                // the VALUE, which is the only thing that can catch a
+                // parameter nobody enumerated — `?t=`, `?sas=`, and
+                // every name a third-party API invented. Auto-instrumented
+                // URLs are full of those.
+                if (! self::parameterIsCredential($m[2][0], $ambiguous)
+                    && ! $this->valueLooksLikeCredential(self::decodedValue($m[3][0]))) {
                     // `url=https://x/?token=SECRET` — the outer assignment is
                     // not a credential, but the match consumed its value and
                     // with it the query inside. Look again in there, once.
@@ -265,6 +306,9 @@ final class Redactor
         // context the way `key` and `code` do. `pwd` is NOT among them —
         // `pwd=/srv/app` is a working directory in any shell-flavoured log.
         'sig', 'jwt', 'otp',
+        // A session id in a URL is a credential — that is what session
+        // fixation is — and it arrives spelled both ways.
+        'session_id', 'sessionid',
     ];
 
     /**
@@ -280,6 +324,31 @@ final class Redactor
     public const AMBIGUOUS_PARAMETERS = ['key', 'auth', 'code', 'state', 'pwd'];
 
     /**
+     * Words that turn an ambiguous parameter into an unambiguous one.
+     *
+     * `key` on its own could be a sort key. Behind one of these it is a
+     * credential and nothing else — and `postal`, `sort`, `status` and
+     * `zip` are conspicuously not here, which is the point.
+     *
+     * @var list<string>
+     */
+    /**
+     * Trailing words that describe a parameter instead of naming it,
+     * and are dropped before the credential words are looked for.
+     *
+     * `aws_access_key_id` is an access key. `token_count` is not a
+     * token, which is why `count` is not here.
+     *
+     * @var list<string>
+     */
+    public const DESCRIPTIVE_SUFFIXES = ['id', 'value', 'header', 'param'];
+
+    public const CREDENTIAL_QUALIFIERS = [
+        'private', 'secret', 'api', 'access', 'auth', 'client', 'app',
+        'encryption', 'signing', 'consumer', 'shared', 'master',
+    ];
+
+    /**
      * Is this parameter NAME a credential, however it was spelled?
      *
      * Decoded first, because `%74oken` and `access_token%5B0%5D` are the same
@@ -292,44 +361,331 @@ final class Redactor
      *                                where `code` and `key` mean what they
      *                                say. False for loose prose.
      */
+    /**
+     * Whether these segments spell one of the always-credential names.
+     *
+     * @param  list<string>  $segments
+     */
+    private static function namesACredential(array $segments): bool
+    {
+        $whole = implode('_', $segments);
+        $joined = implode('', $segments);
+
+        foreach (self::CREDENTIAL_PARAMETERS as $credential) {
+            // Whole, as a suffix, or run together. `ACCESSTOKEN` has no
+            // separator and no capital to split on, so only the joined
+            // comparison sees it — and a name shouted in capitals is
+            // what a hand-written query string looks like.
+            $compact = str_replace('_', '', $credential);
+
+            if ($whole === $credential
+                || str_ends_with($whole, '_'.$credential)
+                || $joined === $compact) {
+                return true;
+            }
+
+            // A single run with nothing to split on — `ACCESSTOKEN`,
+            // `myapikey` — matched as a suffix of the run itself.
+            //
+            // Only for a name that had no separator at all (anything
+            // else the checks above already saw) and only for words of
+            // five characters or more: `sig`, `jwt` and `otp` as a bare
+            // suffix would start finding them inside ordinary words, and
+            // a redactor that eats real data is one that gets switched
+            // off.
+            if (count($segments) === 1 && strlen($compact) >= 5 && str_ends_with($joined, $compact)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     public static function parameterIsCredential(string $name, bool $allowAmbiguous = true): bool
     {
-        // Decode and strip only when there is something to decode or strip:
-        // almost every name is plain, and this runs once per pair.
+        $segments = self::segments($name);
+
+        if ($segments === []) {
+            return false;
+        }
+
+        // A trailing word that describes the parameter rather than
+        // naming it. `aws_access_key_id` IS an access key; the `id` is
+        // noise, and stripping it is what lets the suffix rules see
+        // the word that matters.
+        //
+        // Deliberately four words and not "any trailing segment": the
+        // suite already protects `token_count`, `secret_count`,
+        // `api_key_name` and `signature_required`, which are a count
+        // of tokens, a count of secrets, the NAME of a key and a
+        // boolean. Matching a credential word anywhere in the name
+        // caught all four, which is how the first version of this
+        // broke them.
+        // Before stripping anything. `session_id` is on the credential
+        // list precisely BECAUSE of the `id` — a session id in a URL is
+        // the thing session fixation steals — and treating the suffix as
+        // noise first hid the only entry that needs it. The test that
+        // covered this passed anyway, because the secret it used was
+        // caught by the value-shape rule whatever the parameter was
+        // called.
+        if (self::namesACredential($segments)) {
+            return true;
+        }
+
+        if (count($segments) > 1 && in_array(end($segments), self::DESCRIPTIVE_SUFFIXES, true)) {
+            array_pop($segments);
+
+            if (self::namesACredential($segments)) {
+                return true;
+            }
+        }
+
+        $whole = implode('_', $segments);
+
+        if (! $allowAmbiguous) {
+            return false;
+        }
+
+        foreach (self::AMBIGUOUS_PARAMETERS as $ambiguous) {
+            if ($whole === $ambiguous) {
+                return true;
+            }
+
+            // At the END, behind a word that settles it — and the
+            // end is after the descriptive suffix has been dropped,
+            // which is what lets `AWSAccessKeyId` through as
+            // `aws access key`.
+            //
+            // Not anywhere in the name: `api_key_name` is the NAME of
+            // a key rather than a key, and a rule that looked at every
+            // position took it.
+            $last = count($segments) - 1;
+
+            if ($last > 0
+                && $segments[$last] === $ambiguous
+                && in_array($segments[$last - 1], self::CREDENTIAL_QUALIFIERS, true)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * A parameter name reduced to its words.
+     *
+     * Every spelling of the same parameter has to arrive here as the
+     * same list, because an application does not control what a
+     * third-party API calls its token and an attacker picks the
+     * spelling deliberately. All of these are `access token`:
+     *
+     *     access_token   access-token   access.token
+     *     accessToken    x-accessToken  ACCESSTOKEN
+     *     access+token   access%20token token[0]
+     *
+     * `+` and a literal space because PHP parses both as a separator
+     * in a query string, `%xx` because the decoded name is the one the
+     * receiving application reads, and the bracket truncation because
+     * `token[a][b]` is the parameter `token` while
+     * `filters[postal_code]` is the parameter `filters`.
+     *
+     * @return list<string>
+     */
+    private static function segments(string $name): array
+    {
         if (str_contains($name, '%')) {
             $name = rawurldecode($name);
         }
 
-        $name = strtolower($name);
-
-        // Truncate at the FIRST bracket rather than stripping trailing levels
-        // with a regex. `(?:\[[^\]]*\])+$` is quadratic on a name that opens
-        // brackets and never closes them — 20k of them took 67ms and 100k over
-        // a second, with no PCRE error to trip the fail-closed guard, so it
-        // was a denial of service reachable from a query string. The root name
-        // is what matters anyway: `token[a][b]` is `token`, and
-        // `filters[postal_code]` is `filters`.
+        // At the FIRST bracket, not by stripping trailing levels with
+        // a regex: `(?:\[[^\]]*\])+$` is quadratic on a name that
+        // opens brackets and never closes them — 100k of them took
+        // over a second, with no PCRE error to trip the fail-closed
+        // guard, which made it a denial of service reachable from a
+        // query string.
         $bracket = strpos($name, '[');
 
         if ($bracket !== false) {
             $name = substr($name, 0, $bracket);
         }
 
-        // `-` and `.` separate a name the way `_` does, so a header-ish
-        // spelling counts: `x-api-key` is `x_api_key`.
-        $name = strtr($name, ['-' => '_', '.' => '_']);
+        // Split on a capital BEFORE lowercasing, and regardless of
+        // whether the name already has separators: `x-accessToken` has
+        // both, and bailing out on the `-` left the camel hump unsplit.
+        $split = preg_replace('/(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])/', '_', $name);
 
-        if ($allowAmbiguous && in_array($name, self::AMBIGUOUS_PARAMETERS, true)) {
+        $name = strtolower(is_string($split) ? $split : $name);
+        $name = strtr($name, ['-' => '_', '.' => '_', '+' => '_', ' ' => '_']);
+
+        return array_values(array_filter(explode('_', $name), static fn (string $part): bool => $part !== ''));
+    }
+
+    /**
+     * Which personal-data detectors the config asks for.
+     *
+     * `true` means the defaults; a list names them exactly. Unknown
+     * names are dropped rather than throwing, because a typo in a
+     * config file must not break telemetry — and `telemetry:doctor`
+     * reports what is actually active.
+     *
+     * @param  array<string, mixed>  $config
+     * @return list<string>
+     */
+    private static function personalDataFromConfig(array $config): array
+    {
+        $pii = $config['pii'] ?? null;
+
+        if ($pii === null || $pii === false) {
+            return [];
+        }
+
+        $detectors = $pii === true
+            ? PersonalData::defaultDetectors()
+            : (self::stringList(is_array($pii) ? ($pii['detectors'] ?? null) : null) ?? PersonalData::defaultDetectors());
+
+        if (is_array($pii) && ($pii['enabled'] ?? true) === false) {
+            return [];
+        }
+
+        return array_values(array_intersect($detectors, PersonalData::availableDetectors()));
+    }
+
+    /**
+     * The issuer prefixes as one anchored pattern, built on first use.
+     *
+     * Memoised on the instance rather than statically: the list is
+     * configurable, so two applications in one process — a test suite —
+     * must not share one.
+     */
+    private function prefixPattern(): string
+    {
+        if ($this->prefixPattern !== null) {
+            return $this->prefixPattern;
+        }
+
+        $prefixes = array_filter($this->credentialPrefixes, static fn (string $p): bool => $p !== '');
+
+        // Matching nothing, for an empty list: `(?!)` always fails, and
+        // an empty alternation would match everything.
+        return $this->prefixPattern = $prefixes === []
+            ? '/(?!)/'
+            : '/^(?:'.implode('|', array_map(static fn (string $p): string => preg_quote($p, '/'), $prefixes)).')/';
+    }
+
+    /**
+     * A parameter value as the receiving application reads it: quotes
+     * off, percent-decoded. `sk%5Flive%5F…` is the same secret as
+     * `sk_live_…` and matches no prefix without this.
+     */
+    private static function decodedValue(string $value): string
+    {
+        $value = trim($value, '"\'');
+
+        return str_contains($value, '%') ? rawurldecode($value) : $value;
+    }
+
+    /**
+     * Vendor prefixes that are a credential and nothing else.
+     *
+     * A name list cannot help here. `?t=`, `?k=`, `?sas=` and every
+     * other parameter a third-party API invented are unknowable in
+     * advance, and auto-instrumentation records URLs the application did
+     * not write. What IS knowable is what the secret looks like: every
+     * one of these issuers stamps its keys so they can be found in a
+     * leak, which works just as well for finding them before one.
+     *
+     * @var list<string>
+     */
+    private const DEFAULT_CREDENTIAL_PREFIXES = [
+        'sk_live_', 'sk_test_', 'rk_live_', 'rk_test_', 'whsec_',   // Stripe
+        'ghp_', 'gho_', 'ghu_', 'ghs_', 'ghr_', 'github_pat_',      // GitHub
+        'glpat-', 'gldt-',                                          // GitLab
+        'xoxb-', 'xoxp-', 'xoxa-', 'xoxr-', 'xoxs-', 'xapp-',       // Slack
+        'AKIA', 'ASIA',                                             // AWS
+        'AIza',                                                     // Google
+        'SG.',                                                      // SendGrid
+        'shpat_', 'shpss_',                                         // Shopify
+        'npm_', 'dop_v1_', 'doo_v1_', 'dor_v1_',                    // npm, DigitalOcean
+        'sq0atp-', 'sq0csp-',                                       // Square
+        'ya29.',                                                    // Google OAuth
+    ];
+
+    /**
+     * @return list<string>
+     */
+    public static function defaultCredentialPrefixes(): array
+    {
+        return self::DEFAULT_CREDENTIAL_PREFIXES;
+    }
+
+    /**
+     * Does this VALUE look like a credential, whatever it was called?
+     *
+     * The second half of the model, and the half that matters for
+     * auto-instrumentation: a name list only catches parameters someone
+     * thought of, and the URLs an application calls are full of ones
+     * nobody did.
+     *
+     * Two rules, deliberately narrow, because over-redaction is its own
+     * failure — an operator who cannot read the URLs stops trusting the
+     * tool:
+     *
+     *  - A known issuer prefix. Unambiguous, and free to check.
+     *  - Length with mixed character classes: 24+ characters containing
+     *    lower, upper AND digits, which is what a generated token looks
+     *    like and what a slug, an email, a date, a path or a sentence
+     *    does not. A UUID is excluded by name — hex and hyphens only,
+     *    never mixed case — because a UUID in a URL is almost always an
+     *    id somebody needs to read.
+     */
+    /**
+     * The personal-identifier detectors in effect — what `telemetry:doctor`
+     * reports, and the closest thing this package has to evidence of a
+     * control for an audit.
+     *
+     * @return list<string>
+     */
+    public function personalDataDetectors(): array
+    {
+        return $this->personalData;
+    }
+
+    public function valueLooksLikeCredential(string $value): bool
+    {
+        $length = strlen($value);
+
+        if ($length < 8) {
+            return false;
+        }
+
+        // One anchored alternation, compiled once, rather than a
+        // str_starts_with per prefix: twenty-five of those ran for every
+        // parameter of every URL on every span, and measured 9µs a span
+        // — more than a third of the whole redaction pass, to check a
+        // list that almost never matches.
+        if (preg_match($this->prefixPattern(), $value) === 1) {
             return true;
         }
 
-        foreach (self::CREDENTIAL_PARAMETERS as $credential) {
-            if ($name === $credential || str_ends_with($name, '_'.$credential)) {
-                return true;
-            }
+        if (! $this->valueShape || $length < $this->valueMinLength) {
+            return false;
         }
 
-        return false;
+        // A UUID is an identifier, not a secret, and it is the single
+        // most common long value in a real query string.
+        if (preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i', $value) === 1) {
+            return false;
+        }
+
+        // Anything with a space, or a character no token generator emits,
+        // is prose or a path rather than a credential.
+        if (preg_match('/^[A-Za-z0-9._~+\/=-]+$/', $value) !== 1) {
+            return false;
+        }
+
+        return preg_match('/[a-z]/', $value) === 1
+            && preg_match('/[A-Z]/', $value) === 1
+            && preg_match('/[0-9]/', $value) === 1;
     }
 
     /**
@@ -339,7 +695,45 @@ final class Redactor
     {
         return [
             // JWTs — three base64url segments.
-            '/\beyJ[\w-]{10,}\.[\w-]{6,}\.[\w-]{6,}/' => '[REDACTED:jwt]',
+            //
+            // Possessive, and bounded only where the bound cannot
+            // truncate a credential.
+            //
+            // Each pattern begins with a literal — `eyJ`, `Bearer`,
+            // `://` — so the engine starts only where one occurs. That
+            // is what makes them cheap, and why capping the payload
+            // and the token bought nothing except three disclosures:
+            // a credential one character past the cap stopped matching,
+            // and what the pattern no longer covers is exported
+            // verbatim.
+            //
+            // The JWT HEADER is the exception, and the reason is the
+            // literal itself: `-` is a base64url character, so
+            // `eyJaaaaaaaaaa-eyJaaaaaaaaaa-…` is one unbroken run with
+            // an `eyJ` every fourteen characters, and each one starts
+            // another scan of the whole remainder. 218KiB of it cost
+            // 635ms. Bounding the first segment — and only the first —
+            // makes each restart cheap while leaving the payload and
+            // signature, which is where a long token's secret actually
+            // lives, unbounded. 4096 base64 characters is far more
+            // header than any real token carries, x5c chains included.
+            // `e[yw]`, derived rather than listed.
+            //
+            // A JWT header is JSON, so its first byte is `{` and its
+            // second is `"` or whitespace. Base64 packs the first byte
+            // and the top bits of the second into the first two
+            // characters, and every byte JSON allows in that position
+            // yields `ey` or `ew` — nothing else. Enumerating
+            // three-character prefixes was a losing game: `eyJ` for
+            // `{"`, `ewo` for a newline, `eyA` for a space, and a
+            // header written with CRLF or a tab produced `ew0` and
+            // `ewk`, which a list of three kept missing.
+            //
+            // Known gap: a header longer than the bound (an x5c
+            // certificate chain), and a token with an empty claims set,
+            // whose `e30` payload is below the minimum that keeps
+            // ordinary prose out.
+            '/\be[yw][\w-]{11,4096}+\.[\w-]{6,}+\.[\w-]{6,}/' => '[REDACTED:jwt]',
             // HTTP credential schemes embedded in messages.
             //
             // Two ways to qualify, because a flat length threshold cannot
@@ -361,9 +755,23 @@ final class Redactor
             // Only the scheme is case-insensitive. An `/i` over the whole
             // pattern makes `[A-Z0-9]` match lowercase too and swallows the
             // prose, which is how the first attempt at this failed.
-            '/\b((?i:Bearer|Basic))\s+(?:[A-Za-z0-9._~+\/-]{16,}={0,2}|(?=[A-Za-z0-9._~+\/=-]{4,})[A-Za-z][a-z]*[A-Z0-9_~+\/][A-Za-z0-9._~+\/=-]*)/' => '$1 [REDACTED]',
+            // `\d{4,}` for the short numeric kind — a one-time code
+            // presented as a bearer token is still a bearer token, and
+            // no auth-param list (`realm=api`, `error=invalid_token`)
+            // is four digits with nothing else.
+            '/\b((?i:Bearer|Basic))\s+(?:[A-Za-z0-9._~+\/-]{16,}+={0,2}|\d{4,}+|(?=[A-Za-z0-9._~+\/=-]{4,})[A-Za-z][a-z]*+[A-Z0-9_~+\/][A-Za-z0-9._~+\/=-]*)/' => '$1 [REDACTED]',
             // Userinfo in URLs: scheme://user:pass@host.
-            '#\b([a-z][a-z0-9+.-]*://)[^/@\s:]+:[^/@\s]+@#i' => '$1[REDACTED]@',
+            //
+            // Anchored on `://` and not on the scheme. Matching the
+            // scheme meant an unbounded run of scheme characters before
+            // it, which is what made 62KiB of `a+.-` cost 198ms; and
+            // bounding that run instead would have stopped matching a
+            // credential preceded by a long unbroken word, because the
+            // run had been swallowing it. The scheme was never needed:
+            // it is reproduced verbatim in the replacement.
+            // `*` on the username, not `+`: `https://:hunter2@host`
+            // has no username and is still a password in a URL.
+            '#://[^/@\s:]*+:[^/@\s]++@#' => '://[REDACTED]@',
             // NOTE: the two query-parameter patterns that used to live here
             // are gone. Matching a parameter by literal text could never see
             // that `%74oken=` and `token%5B%5D=` are the same secret, and a
@@ -428,6 +836,10 @@ final class Redactor
                     $this->value('event.name', $event->name),
                     $event->timeUnixNano,
                     $this->attributes($event->attributes),
+                    // Carried. Rebuilding the event without it reset
+                    // the count to zero, and the OTLP record then said
+                    // nothing was dropped.
+                    $event->droppedAttributes,
                 ),
                 $span->events(),
             ));
@@ -509,13 +921,35 @@ final class Redactor
         return $attributes;
     }
 
-    public function value(string $key, string $value): string
+    public function value(string|int $key, string $value): string
     {
+        // An int key is legal — PHP turns `'0'` into `0` on the way
+        // into an array — and everything below reads the key as text.
+        $key = (string) $key;
+
         if (! $this->enabled) {
             return $value;
         }
 
         if ($this->keyIsSensitive($key)) {
+            return $this->replacement;
+        }
+
+        // Redact first, truncate after. The other order is what I
+        // shipped and it was wrong: cutting at a fixed byte can remove
+        // the very character a rule needs. Pad so that
+        // `https://alice:hunter2` ends exactly at the boundary and the
+        // `@` that identifies it as userinfo is on the far side — the
+        // password then survives in full, in the output, with a
+        // `(truncated)` marker after it. The secret being short is the
+        // whole problem; my comment claimed the opposite.
+        //
+        // Cost is bounded by a ceiling instead. A value past it is not
+        // scanned, because scanning it is where the pathological cases
+        // live — it is replaced outright, which is the fail-closed
+        // answer and the only safe one for something nobody can read
+        // anyway.
+        if ($this->maxValueLength > 0 && strlen($value) > $this->scanCeiling()) {
             return $this->replacement;
         }
 
@@ -545,11 +979,49 @@ final class Redactor
 
         $value = $this->redactEncodedParameters($value);
 
+        // Personal identifiers last among the built-ins: by here the
+        // credentials are gone, so this walks a smaller string, and an
+        // email inside a redacted token is no longer there to find.
+        if ($this->personalData !== []) {
+            $value = PersonalData::scrub($value, $this->personalData, $this->replacement);
+        }
+
         if ($this->custom !== null) {
             $value = FailSafe::guard(fn (): string => ($this->custom)($key, $value) ?? $value) ?? $value;
         }
 
-        return $value;
+        return $this->cap($value);
+    }
+
+    /**
+     * Bound a value's length, marking where it was cut.
+     *
+     * Applied AFTER redaction, so a rule can never be defeated by the
+     * cut. The marker matters too: a silently truncated value looks
+     * like a complete one, and somebody will eventually debug for an
+     * hour against a string that ends in the middle of the answer.
+     */
+    private function cap(string $value): string
+    {
+        if ($this->maxValueLength <= 0 || strlen($value) <= $this->maxValueLength) {
+            return $value;
+        }
+
+        return substr($value, 0, $this->maxValueLength).'… (truncated)';
+    }
+
+    /**
+     * How long a value may be and still be worth scanning.
+     *
+     * Sixteen times the export cap: generous enough that nothing real
+     * hits it, small enough that the quadratic corners of the pattern
+     * set stay in microseconds. Past it the value is replaced rather
+     * than scanned or truncated, because a half-scanned secret is a
+     * leak and an unscanned one is worse.
+     */
+    private function scanCeiling(): int
+    {
+        return $this->maxValueLength * 16;
     }
 
     /** @var array<string, bool> */
@@ -583,9 +1055,21 @@ final class Redactor
             return false;
         }
 
-        $normalized = strtolower($key);
+        // Split a capital into a separator first, for the same reason
+        // the parameter matcher does: `stripe.accessToken` and
+        // `log.context.clientSecret` are the same keys as their
+        // snake_case spellings to everyone except a matcher that only
+        // knows `[._-]`, and camelCase is what a structured log
+        // context from a JavaScript-facing service looks like.
+        $split = preg_replace('/(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])/', '_', $key);
+        $normalized = strtolower(is_string($split) ? $split : $key);
 
-        if (in_array($normalized, array_map(strtolower(...), $this->safeKeys), true)) {
+        // The exemption list is matched on the key AS WRITTEN too, so
+        // an app that exempted `my.knownSafe.bucket` is not caught out
+        // by the normalisation above.
+        $exempt = array_map(strtolower(...), $this->safeKeys);
+
+        if (in_array($normalized, $exempt, true) || in_array(strtolower($key), $exempt, true)) {
             return false;
         }
 

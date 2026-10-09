@@ -215,6 +215,26 @@ incoming `baggage` header back into its own context
 too, since baggage is caller-supplied, unvalidated data and should
 follow the same trust boundary as continuing the trace itself.
 
+### Behind an edge that injects traceparent
+
+Some load balancers and proxies set a `traceparent` on every request so
+their access log carries a trace id that joins the backend's trace, but
+export no span themselves. Continuing such a header makes every request
+span the child of a span that never arrives, and trace backends list
+those traces as missing their root.
+
+```dotenv
+TELEMETRY_TRACES_CONTINUE_INCOMING_PARENT=false
+```
+
+The request then adopts the incoming trace id (the edge's log line still
+joins the trace) and the incoming sampled flag (subject to
+`trust_incoming_sampling`), but starts as the root span, carrying a
+[span link](#span-links-retries) to the span id the edge named. Leave it
+on (the default) whenever the caller does export that span, a service
+calling you with `Http::withTraceparent()` or an edge that traces itself,
+so your request span hangs under it.
+
 ## Span links (retries)
 
 Not every causal relationship is a parent. A retried job's attempt N+1
@@ -467,6 +487,22 @@ again — a request making two hundred queries has one `db.connect`, not two
 hundred. The same lazy resolution is why the timing wraps the resolver closure
 rather than `ConnectionFactory::make()`, which returns before any socket is
 opened.
+
+Redis depends on the client:
+
+- **phpredis** opens the socket in Laravel's connector, so the connector is
+  timed.
+- **predis** opens it on the first command, long after the connector has
+  returned. Timing the connector would report a few microseconds of object
+  construction, so instead the client is handed a connection factory whose
+  connections time their own handshake (DNS, TCP, TLS and the AUTH/SELECT
+  init commands) when they actually connect. Every node predis talks to goes
+  through that factory, so under Sentinel a cold request shows two
+  `redis.connect` spans: one for the sentinel it asked, one for the master
+  it was sent to. `server.address` is the node actually dialled. A
+  connection that sets its own predis `connections` option keeps its own
+  factory and is not timed, and neither is a scheme mapped to anything other
+  than predis's stream connection (Relay, a custom class).
 
 These spans are **not** detail-marked. A connect is rare and high-signal, so
 it survives `traces.details.mode=tail` trimming — which is exactly when you

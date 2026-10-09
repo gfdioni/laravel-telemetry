@@ -10,7 +10,9 @@ use Cbox\Telemetry\Metrics\MetricDefinition;
 use Cbox\Telemetry\Metrics\MetricFamily;
 use Cbox\Telemetry\Metrics\MetricType;
 use Cbox\Telemetry\Metrics\Sample;
+use Cbox\Telemetry\Support\ExportOutcome;
 use Cbox\Telemetry\Support\ExportResult;
+use Cbox\Telemetry\Support\ExportStatus;
 use Cbox\Telemetry\Support\TelemetryBatch;
 use Cbox\Telemetry\Tracing\Tracer;
 
@@ -103,4 +105,48 @@ it('surfaces partial rejections when everything else succeeded', function () {
 
     expect($result->success)->toBeTrue()
         ->and($result->rejected)->toBe(2);
+});
+
+it('sums rejections across signals and keeps every reason', function () {
+    // Traces rejecting three and logs rejecting seven is ten, not
+    // three — and the operator reading `telemetry:flush` needs both
+    // reasons, not whichever came first.
+    $transport = new FakeTransport;
+    $transport->responses['/v1/traces'] = ExportResult::partial(3, 'bad resource on spans');
+    $transport->responses['/v1/logs'] = ExportResult::partial(7, 'bad resource on logs');
+
+    $result = (new OtlpExporter($transport, new OtlpSerializer([])))->export(otlpBatch());
+
+    expect($result->rejected)->toBe(10)
+        ->and($result->reason)->toContain('spans')
+        ->and($result->reason)->toContain('logs');
+});
+
+it('does not report an unreadable response as a clean export', function () {
+    $transport = new FakeTransport;
+    $transport->responses['/v1/traces'] = ExportResult::partial(0, 'the response was too large to read');
+
+    $result = (new OtlpExporter($transport, new OtlpSerializer([])))->export(otlpBatch());
+
+    expect(ExportOutcome::of('otlp', $result)->status)->toBe(ExportStatus::Partial);
+});
+
+it('does not lose rejections when another signal failed outright', function () {
+    // The mixed batch: traces got a 503, logs was accepted with seven
+    // rejected. The failure is what decides the retry, so it has to be
+    // the result — but the seven are real data loss and were
+    // disappearing with the result that carried them.
+    //
+    // A 503 rather than an unreachable collector, because unreachable
+    // stops the batch before logs is ever posted — there is no mixed
+    // result to lose in that case.
+    $transport = new FakeTransport;
+    $transport->responses['/v1/traces'] = ExportResult::retryable('HTTP 503: overloaded', 30);
+    $transport->responses['/v1/logs'] = ExportResult::partial(7, 'bad resource');
+
+    $result = (new OtlpExporter($transport, new OtlpSerializer([])))->export(otlpBatch());
+
+    expect($result->success)->toBeFalse()
+        ->and($result->retryable)->toBeTrue()
+        ->and($result->reason)->toContain('7 data points rejected');
 });

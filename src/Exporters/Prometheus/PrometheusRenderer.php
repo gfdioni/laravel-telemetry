@@ -6,6 +6,7 @@ namespace Cbox\Telemetry\Exporters\Prometheus;
 
 use Cbox\Telemetry\Metrics\Exemplar;
 use Cbox\Telemetry\Metrics\HistogramSample;
+use Cbox\Telemetry\Metrics\MetricDefinition;
 use Cbox\Telemetry\Metrics\MetricFamily;
 use Cbox\Telemetry\Metrics\MetricType;
 use Cbox\Telemetry\Metrics\Sample;
@@ -62,7 +63,7 @@ final class PrometheusRenderer
                 $output[] = '# HELP '.$familyName.' '.$this->escapeHelp($help);
             }
 
-            $output[] = '# TYPE '.$familyName.' '.$family->type()->value;
+            $output[] = '# TYPE '.$familyName.' '.$this->prometheusType($family->type());
 
             if ($openMetrics && $family->definition->unit !== '' && $this->unitSuffix($family->definition->unit) !== '') {
                 // OpenMetrics allows the UNIT metadata line and requires it to
@@ -195,13 +196,14 @@ final class PrometheusRenderer
     private function occupiedNames(MetricFamily $family, bool $openMetrics): array
     {
         $base = $this->familyName($family);
+        $total = $this->append($base, '_total');
 
         return match ($family->type()) {
             // Classic: metadata and samples both under `<name>_total`.
             // OpenMetrics: metadata under `<name>`, samples under `<name>_total`.
             MetricType::Counter => $openMetrics
-                ? [$base, $base.'_total', $base.'_created']
-                : [$base.'_total'],
+                ? [$base, $total, $base.'_created']
+                : [$total],
             MetricType::Histogram => $openMetrics
                 ? [$base, $base.'_bucket', $base.'_sum', $base.'_count', $base.'_created']
                 : [$base, $base.'_bucket', $base.'_sum', $base.'_count'],
@@ -259,7 +261,7 @@ final class PrometheusRenderer
      */
     private function familyName(MetricFamily $family): string
     {
-        return $family->definition->prometheusName().$this->unitSuffix($family->definition->unit);
+        return $this->append($family->definition->prometheusName(), $this->suffixFor($family->definition));
     }
 
     /**
@@ -267,27 +269,102 @@ final class PrometheusRenderer
      */
     private function renderedName(MetricFamily $family): string
     {
-        $name = $family->definition->prometheusName().$this->unitSuffix($family->definition->unit);
+        $name = $this->familyName($family);
 
-        return $family->type() === MetricType::Counter ? $name.'_total' : $name;
+        return $family->type() === MetricType::Counter ? $this->append($name, '_total') : $name;
     }
 
     /**
      * The unit as a Prometheus name suffix. OTel/UCUM unit → Prometheus base
-     * unit word (`ms` → `_milliseconds`, `By` → `_bytes`); unknown or unitless
-     * ('1', '', 'count') get nothing. Placed before `_total`/`_bucket`, so a
-     * `ms` counter reads `<name>_milliseconds_total`.
+     * unit word (`ms` → `_milliseconds`, `By` → `_bytes`); unknown or
+     * unitless ('', 'count') get nothing. Placed before `_total`/`_bucket`,
+     * so a `ms` counter reads `<name>_milliseconds_total`.
+     *
+     * The unitless `1` is deliberately absent here: the OTLP translation
+     * gives it `_ratio`, but only on a gauge — a counter or histogram of
+     * dimensionless things is a count, not a ratio. {@see ratioSuffix()}.
+     */
+    /**
+     * The suffix for a whole family, including the gauge-only `_ratio`.
+     */
+    private function suffixFor(MetricDefinition $definition): string
+    {
+        // A non-monotonic sum lands on a Prometheus gauge, so it earns the
+        // suffix too; a counter or histogram of dimensionless things is a
+        // count and must not.
+        if ($definition->unit === '1' && in_array($definition->type, [MetricType::Gauge, MetricType::UpDownCounter], true)) {
+            // `cache.hit_ratio` is already a ratio; `cache_hit_ratio_ratio`
+            // is nobody's metric.
+            return str_ends_with($definition->prometheusName(), '_ratio') ? '' : '_ratio';
+        }
+
+        return $this->unitSuffix($definition->unit);
+    }
+
+    /**
+     * Prometheus has no up-down counter. The OTLP translation maps a
+     * non-monotonic sum onto a gauge — which is the right lossy answer for
+     * a text format that only knows four types, and why the OTLP exporter
+     * is where the distinction survives.
+     */
+    private function prometheusType(MetricType $type): string
+    {
+        return match ($type) {
+            MetricType::UpDownCounter => MetricType::Gauge->value,
+            default => $type->value,
+        };
+    }
+
+    /**
+     * The OTLP-to-Prometheus unit table.
+     *
+     * `Histogram::time()` will happily record in `us` or `ns`, and both
+     * used to render under the bare name — so a microsecond histogram and
+     * a nanosecond one, side by side, were two families claiming the same
+     * series with values a thousand apart.
      */
     private function unitSuffix(string $unit): string
     {
         return match ($unit) {
+            'ns' => '_nanoseconds',
+            'us' => '_microseconds',
             'ms' => '_milliseconds',
             's' => '_seconds',
+            'min' => '_minutes',
+            'h' => '_hours',
+            'd' => '_days',
             'By', 'bytes' => '_bytes',
+            'KiBy' => '_kibibytes',
+            'MiBy' => '_mebibytes',
+            'GiBy' => '_gibibytes',
+            'TiBy' => '_tebibytes',
             'By/s' => '_bytes_per_second',
+            'Hz' => '_hertz',
+            'Cel' => '_celsius',
+            'V' => '_volts',
+            'A' => '_amperes',
+            'J' => '_joules',
+            'W' => '_watts',
             '%' => '_percent',
             default => '',
         };
+    }
+
+    /**
+     * Append a suffix the name does not already carry.
+     *
+     * A metric called `request.duration.seconds` with unit `s` used to
+     * render as `request_duration_seconds_seconds`, and a counter someone
+     * had already named `…_total` gained a second one. The translation
+     * spec says to add the suffix when it is missing, not unconditionally.
+     */
+    private function append(string $name, string $suffix): string
+    {
+        if ($suffix === '' || str_ends_with($name, $suffix)) {
+            return $name;
+        }
+
+        return $name.$suffix;
     }
 
     /**

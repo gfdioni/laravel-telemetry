@@ -6,6 +6,7 @@ namespace Cbox\Telemetry\Console;
 
 use Cbox\Telemetry\Contracts\MetricStore;
 use Cbox\Telemetry\Contracts\NativeRuntime;
+use Cbox\Telemetry\Contracts\ReportsOverflow;
 use Cbox\Telemetry\Exporters\Otlp\OtlpSerializer;
 use Cbox\Telemetry\Exporters\Otlp\OtlpTransport;
 use Cbox\Telemetry\Exporters\Spool\Spool;
@@ -13,7 +14,9 @@ use Cbox\Telemetry\Metrics\MetricDefinition;
 use Cbox\Telemetry\Metrics\MetricType;
 use Cbox\Telemetry\Native\NativeProfiler;
 use Cbox\Telemetry\Support\Cast;
+use Cbox\Telemetry\Support\FailSafe;
 use Cbox\Telemetry\Support\Redactor;
+use Cbox\Telemetry\Support\SharedState;
 use Cbox\Telemetry\TelemetryManager;
 use Cbox\Telemetry\Tracing\Span;
 use Cbox\Telemetry\Tracing\SpanKind;
@@ -31,9 +34,28 @@ final class DoctorCommand extends Command
 
     protected $description = 'Verify the telemetry configuration, store and exporters';
 
-    public function handle(TelemetryManager $telemetry, MetricStore $store, Spool $spool): int
+    /**
+     * The store and the spool are resolved INSIDE their checks, not
+     * injected here.
+     *
+     * Method injection resolves them before the body runs, so an apcu
+     * store on a build without the extension — or a spool pointed at an
+     * unwritable file — threw out of the command entirely. The one tool
+     * whose job is to explain a broken configuration crashed on the
+     * configurations it exists to explain, and printed nothing.
+     */
+    public function handle(): int
     {
-        if (! $telemetry->enabled()) {
+        // Nothing is injected. Resolving the manager builds the registry,
+        // which builds the store — so a method signature was enough to
+        // crash this command on the very configuration it exists to
+        // explain, and print nothing at all while doing it.
+        //
+        // Every check that reads config runs regardless, because those
+        // are the ones that say WHY the store cannot be built. Only the
+        // OTLP check needs the manager, and it says so when it cannot
+        // have one.
+        if (! config('telemetry.enabled')) {
             $this->components->warn('Telemetry is DISABLED (TELEMETRY_ENABLED=false). Nothing else to check.');
 
             return self::SUCCESS;
@@ -41,14 +63,16 @@ final class DoctorCommand extends Command
 
         $this->components->info('Telemetry is enabled.');
 
-        $healthy = $this->checkStore($store);
+        $healthy = $this->checkStore();
+        $this->checkSeriesBudget();
+        $this->checkCooldownState();
         $this->checkCacheCollision();
         $this->checkRedaction();
         $this->checkProfiling();
         $this->checkNative();
         $healthy = $this->checkPrometheus() && $healthy;
-        $healthy = $this->checkOtlp($telemetry) && $healthy;
-        $healthy = $this->checkSpool($spool) && $healthy;
+        $healthy = $this->checkOtlp() && $healthy;
+        $healthy = $this->checkSpool() && $healthy;
 
         if ($healthy) {
             $this->components->info('All checks passed.');
@@ -59,11 +83,12 @@ final class DoctorCommand extends Command
         return $healthy ? self::SUCCESS : self::FAILURE;
     }
 
-    private function checkStore(MetricStore $store): bool
+    private function checkStore(): bool
     {
         $driver = Cast::string(config('telemetry.store'), 'redis');
 
         try {
+            $store = app(MetricStore::class);
             $definition = new MetricDefinition('telemetry.doctor.heartbeat', MetricType::Gauge, 'telemetry:doctor round-trip check', 's');
 
             $store->setGauge($definition, [], microtime(true));
@@ -126,6 +151,72 @@ final class DoctorCommand extends Command
      * informational, not a failure — the setup still works, it's just
      * one `cache:clear` away from an empty dashboard.
      */
+    /**
+     * Metric families that have hit their field budget.
+     *
+     * The store refuses new series past the budget and counts the
+     * refusals; this is where an operator finds out. A family in
+     * overflow means a label somewhere is carrying a value it should
+     * not — a user id, a URL, a job payload — and the fix is at that
+     * label, not here.
+     */
+    private function checkSeriesBudget(): void
+    {
+        $overflowing = FailSafe::guard(function (): array {
+            $store = app(MetricStore::class);
+
+            if (! $store instanceof ReportsOverflow) {
+                return [];
+            }
+
+            return $store->overflowingFamilies();
+        }) ?? [];
+
+        if ($overflowing === []) {
+            $this->components->twoColumnDetail('Series budget', '<fg=green>no family over its field budget</>');
+
+            return;
+        }
+
+        foreach ($overflowing as $name => $refused) {
+            $this->components->twoColumnDetail(
+                "Series budget [{$name}]",
+                "<fg=yellow>{$refused} series refused — a label is unbounded</>",
+            );
+        }
+    }
+
+    /**
+     * Whether the circuit breaker and the report throttle mean anything
+     * on this SAPI.
+     *
+     * Both suppress work for a cooldown after a failure. Without shared
+     * memory the cooldown is per-process, and under PHP-FPM that is per
+     * request — so a dead collector is rediscovered, and its connect
+     * timeout paid, on every single request. Worth a warning: it is
+     * invisible until the day it matters.
+     */
+    private function checkCooldownState(): void
+    {
+        if (SharedState::isShared()) {
+            $this->components->twoColumnDetail('Failure cooldowns', '<fg=green>shared across the pool (APCu)</>');
+
+            return;
+        }
+
+        if (PHP_SAPI === 'cli') {
+            $this->components->twoColumnDetail('Failure cooldowns', 'per-process — correct for a long-lived worker');
+
+            return;
+        }
+
+        $this->components->twoColumnDetail('Failure cooldowns', '<fg=yellow>per-request — install ext-apcu</>');
+        $this->components->warn(
+            'Without APCu the OTLP circuit breaker and the report throttle reset every request, '
+            .'so an unreachable collector costs each request its connect timeout.',
+        );
+    }
+
     private function checkCacheCollision(): void
     {
         $store = Cast::string(config('telemetry.store'), 'redis');
@@ -210,6 +301,8 @@ final class DoctorCommand extends Command
             }
         }
 
+        $this->reportPersonalData();
+
         if ($stale === []) {
             $this->components->twoColumnDetail('Redaction', '<fg=green>OK — the package defaults are in effect</>');
 
@@ -247,6 +340,32 @@ final class DoctorCommand extends Command
         $this->components->warn(
             'redaction.replace_defaults is on, so the package lists are NOT unioned in and the entries above '
             .'are not running. Turn it off, or copy the missing entries in deliberately.',
+        );
+    }
+
+    /**
+     * Which personal-identifier detectors are actually running.
+     *
+     * Printed whether or not any are, because "none" is the answer an
+     * auditor is asking for as often as a list — and because an
+     * operator who set `pii => true` in a config the package never read
+     * would otherwise have no way to find out.
+     */
+    private function reportPersonalData(): void
+    {
+        $active = Redactor::fromConfig(
+            Cast::stringKeyedArray(config('telemetry.redaction', [])),
+        )->personalDataDetectors();
+
+        if ($active === []) {
+            $this->components->twoColumnDetail('Personal identifiers', 'not scrubbed (redaction.pii is off)');
+
+            return;
+        }
+
+        $this->components->twoColumnDetail(
+            'Personal identifiers',
+            '<fg=green>scrubbing '.implode(', ', $active).'</>',
         );
     }
 
@@ -380,7 +499,7 @@ final class DoctorCommand extends Command
             .($missing === [] ? '' : ' (unavailable: '.implode(', ', $missing).')');
     }
 
-    private function checkOtlp(TelemetryManager $telemetry): bool
+    private function checkOtlp(): bool
     {
         /** @var list<string> $exporters */
         $exporters = config('telemetry.exporters', []);
@@ -402,7 +521,18 @@ final class DoctorCommand extends Command
             compress: $compressed,
         );
 
-        $payload = $this->probeBatch($telemetry->resource());
+        // The one check that needs the manager, and the only place the
+        // store's failure to build can stop a check rather than explain
+        // one.
+        try {
+            $resource = app(TelemetryManager::class)->resource();
+        } catch (Throwable $e) {
+            $this->components->twoColumnDetail('OTLP', '<fg=red>SKIPPED — telemetry could not be assembled: '.$e->getMessage().'</>');
+
+            return false;
+        }
+
+        $payload = $this->probeBatch($resource);
 
         $start = microtime(true);
         $result = $transport->post('/v1/traces', $payload);
@@ -469,7 +599,7 @@ final class DoctorCommand extends Command
      * keeping up (or was never scheduled at all): past max_items the
      * spool silently drops its oldest entries with no other warning.
      */
-    private function checkSpool(Spool $spool): bool
+    private function checkSpool(): bool
     {
         if (! config('telemetry.otlp.spool.enabled', false)) {
             $this->components->twoColumnDetail('OTLP spool', 'disabled');
@@ -478,7 +608,7 @@ final class DoctorCommand extends Command
         }
 
         try {
-            $depth = $spool->size();
+            $depth = app(Spool::class)->size();
         } catch (Throwable $e) {
             $this->components->twoColumnDetail('OTLP spool', '<fg=red>FAILED — '.$e->getMessage().'</>');
 

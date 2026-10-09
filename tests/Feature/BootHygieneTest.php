@@ -1,0 +1,93 @@
+<?php
+
+declare(strict_types=1);
+
+use Cbox\SystemMetrics\SystemMetrics;
+use Cbox\Telemetry\Contracts\MetricStore;
+use Cbox\Telemetry\Facades\Telemetry;
+use Cbox\Telemetry\Metrics\Registry;
+use Cbox\Telemetry\Support\ResourceDetector;
+use Cbox\Telemetry\TelemetryManager;
+use Cbox\Telemetry\TelemetryServiceProvider;
+use Cbox\Telemetry\Tracing\Tracer;
+use Illuminate\Container\Container;
+
+/**
+ * The service provider does registrations, not work.
+ *
+ * Building the manager builds the resource, which reads `.git` and probes
+ * container and environment files. Doing that while the application is
+ * still booting costs every request the setup cost of a feature it may
+ * never use — and it is the one rule this package states about itself, so
+ * it is worth a test rather than a convention.
+ */
+it('does not build the manager while booting', function () {
+    expect($this->app->resolved(TelemetryManager::class))->toBeFalse();
+});
+
+it('registers the host provider anyway, once something asks for the manager', function () {
+    // Deferring the registration must not lose it: the provider is armed
+    // by a resolution hook, so the families appear the first time anyone
+    // collects. The suite disables the provider by default, so this
+    // re-runs the boot-time pass with it on.
+    config()->set('telemetry.providers.system.enabled', true);
+
+    (new TelemetryServiceProvider($this->app))->boot();
+
+    $names = array_map(static fn ($family): string => $family->name(), Telemetry::collect());
+
+    expect($names)->toContain('system.memory.usage');
+})->skip(fn (): bool => ! class_exists(SystemMetrics::class), 'needs cboxdk/system-metrics');
+
+it('lets the operator name the host over the detected one', function () {
+    // `OTEL_RESOURCE_ATTRIBUTES` is the OpenTelemetry standard override
+    // and outranks detection. It could not: the resource seeded
+    // `host.name` from `gethostname()` first, and the merge keeps what is
+    // already there. In a container whose hostname is a random id, the
+    // real machine's name never arrived.
+    putenv('OTEL_RESOURCE_ATTRIBUTES=host.name=web-3.fleet');
+    ResourceDetector::flush();
+
+    $provider = new TelemetryServiceProvider($this->app);
+    $resource = (fn () => $this->buildResource($this->app))->call($provider);
+
+    expect($resource['host.name'])->toBe('web-3.fleet');
+
+    putenv('OTEL_RESOURCE_ATTRIBUTES');
+    ResourceDetector::flush();
+});
+
+it('builds no metric store, and opens nothing, while booting', function () {
+    // "Passive listener" is the rule, and it has two halves. The loud
+    // half is that no socket is opened, which is easy to get right by
+    // accident. The quiet half is not BUILDING the machinery either: the
+    // registry resolves the metric store, which on the Redis driver
+    // constructs the store and the manager behind it, for every request
+    // in an application that may never record a metric.
+    $resolved = (new ReflectionProperty(Container::class, 'resolved'))->getValue($this->app);
+
+    // Fully-qualified names matter here more than usual: without the
+    // imports above these were `Tests\Feature\Registry` and friends,
+    // which are in no container, so three of the four assertions
+    // passed by naming classes that do not exist.
+    expect(array_keys($resolved))
+        ->not->toContain(Registry::class)
+        ->not->toContain(MetricStore::class)
+        ->not->toContain(TelemetryManager::class)
+        ->not->toContain(Tracer::class);
+});
+
+it('opens no database or cache connection while booting', function () {
+    // Resolving the managers is allowed and unavoidable — hearing about
+    // a Redis command at all means giving the manager a dispatcher. What
+    // is not allowed is a connection: those belong to the application,
+    // when the application wants one.
+    $db = $this->app->make('db');
+    $connections = (new ReflectionProperty($db::class, 'connections'))->getValue($db);
+
+    expect($connections)->toBe([]);
+
+    $redis = $this->app->make('redis');
+
+    expect($redis->connections() ?? [])->toBe([]);
+});

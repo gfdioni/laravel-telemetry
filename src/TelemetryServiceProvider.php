@@ -15,6 +15,7 @@ use Cbox\Telemetry\Contracts\Exporter;
 use Cbox\Telemetry\Contracts\ManagesRequestState;
 use Cbox\Telemetry\Contracts\MetricStore;
 use Cbox\Telemetry\Contracts\NativeRuntime;
+use Cbox\Telemetry\Contracts\RedactsTelemetry;
 use Cbox\Telemetry\Events\TelemetryEvent;
 use Cbox\Telemetry\Exporters\NullExporter;
 use Cbox\Telemetry\Exporters\Otlp\OtlpExporter;
@@ -43,6 +44,7 @@ use Cbox\Telemetry\Instrumentation\HttpClientSpanMiddleware;
 use Cbox\Telemetry\Instrumentation\InstrumentedConnectionFactory;
 use Cbox\Telemetry\Instrumentation\InstrumentedControllerDispatcher;
 use Cbox\Telemetry\Instrumentation\InstrumentedRedisManager;
+use Cbox\Telemetry\Instrumentation\LifecycleInstrumentation;
 use Cbox\Telemetry\Instrumentation\LivewireInstrumentation;
 use Cbox\Telemetry\Instrumentation\MailInstrumentation;
 use Cbox\Telemetry\Instrumentation\ModelInstrumentation;
@@ -76,6 +78,7 @@ use Cbox\Telemetry\Support\GeoResolver;
 use Cbox\Telemetry\Support\GitVersion;
 use Cbox\Telemetry\Support\Redactor;
 use Cbox\Telemetry\Support\ResourceDetector;
+use Cbox\Telemetry\Support\ServiceInstance;
 use Cbox\Telemetry\Support\Symbolicator;
 use Cbox\Telemetry\Tracing\Tracer;
 use Closure;
@@ -90,7 +93,6 @@ use Illuminate\Contracts\Foundation\Application;
 use Illuminate\Contracts\Http\Kernel as HttpKernel;
 use Illuminate\Contracts\Redis\Factory as RedisFactory;
 use Illuminate\Contracts\Routing\Registrar as Router;
-use Illuminate\Database\Connectors\ConnectionFactory;
 use Illuminate\Foundation\Console\AboutCommand;
 use Illuminate\Foundation\Events\Terminating;
 use Illuminate\Foundation\Exceptions\Handler as FrameworkHandler;
@@ -164,6 +166,19 @@ class TelemetryServiceProvider extends ServiceProvider
             fn (Application $app) => new NativeScreenInstrumentation($app),
         );
 
+        // A contract, so an organisation with its own redaction policy —
+        // a compliance list, a shared internal package, a scanner that
+        // already exists elsewhere in the estate — can bind it and have
+        // the whole pipeline use it. The built-in one is configured
+        // entirely from `telemetry.redaction`, so most needs are a
+        // config change rather than a class.
+        $this->app->singleton(
+            RedactsTelemetry::class,
+            fn (Application $app): RedactsTelemetry => Redactor::fromConfig(
+                Cast::stringKeyedArray($app->make('config')->get('telemetry.redaction', [])),
+            ),
+        );
+
         $this->app->singleton(Registry::class, function (Application $app) {
             /** @var list<float> $buckets */
             $buckets = $app->make('config')->get('telemetry.default_buckets', []);
@@ -189,6 +204,7 @@ class TelemetryServiceProvider extends ServiceProvider
             $tracer = new Tracer(
                 sampleRate: $enabled ? Cast::float($config->get('telemetry.traces.sample_rate'), 1.0) : 0.0,
                 maxBuffer: Cast::int($config->get('telemetry.traces.max_buffer'), 5000),
+                maxBufferBytes: Cast::int($config->get('telemetry.traces.max_buffer_bytes'), 33_554_432),
                 alwaysSampleErrors: $enabled && (bool) $config->get('telemetry.traces.always_sample_errors', true),
             );
 
@@ -199,29 +215,73 @@ class TelemetryServiceProvider extends ServiceProvider
             return $tracer;
         });
 
-        $this->app->singleton(TelemetryManager::class, function (Application $app) {
-            $manager = new TelemetryManager(
-                enabled: (bool) $app->make('config')->get('telemetry.enabled'),
-                registry: $app->make(Registry::class),
-                tracer: $app->make(Tracer::class),
-                resource: $this->buildResource($app),
-                maxBufferedEvents: Cast::int($app->make('config')->get('telemetry.events.max_buffer'), 5000),
-                tailDetails: $app->make('config')->get('telemetry.traces.details.mode', 'always') === 'tail',
-                slowRequestMs: Cast::float($app->make('config')->get('telemetry.traces.details.slow_request_ms'), 1000),
-                slowSpanMs: Cast::float($app->make('config')->get('telemetry.traces.details.slow_span_ms'), 100),
-                redactor: Redactor::fromConfig(Cast::stringKeyedArray($app->make('config')->get('telemetry.redaction', []))),
-                selfMetrics: (bool) $app->make('config')->get('telemetry.self_metrics', true),
-            );
-
-            foreach ($this->buildExporters($app) as $exporter) {
-                $manager->addExporter($exporter);
-            }
-
-            return $manager;
-        });
+        // Wrapped, because everything else in this package assumes the
+        // manager can be had.
+        //
+        // TraceRequest takes it by constructor injection, so the
+        // container resolves it before `handle()` and its guards exist;
+        // the deferred filesystem and broadcasting extenders resolve it
+        // when the application asks for a disk or a broadcaster; the
+        // queue payload callback resolves it on dispatch, which
+        // PendingDispatch::__destruct() can reach. A binding that
+        // throws therefore fails a request, a disk, or a dispatch —
+        // guarding thirty-one call sites would be thirty-one chances to
+        // miss one.
+        //
+        // If telemetry cannot be constructed, telemetry is off. That is
+        // the same policy as every guard in the package, applied at the
+        // one place that makes it true everywhere: a disabled manager is
+        // a supported, tested state, and it needs nothing that can fail
+        // — a null store, a tracer that samples nothing, no exporters.
+        $this->app->singleton(TelemetryManager::class, fn (Application $app): TelemetryManager => FailSafe::guard(
+            fn (): TelemetryManager => $this->buildManager($app),
+        ) ?? self::disabledManager());
 
         $this->app->alias(TelemetryManager::class, 'telemetry');
 
+        $this->registerNativeRuntime();
+    }
+
+    /**
+     * A manager that records nothing and can always be built.
+     *
+     * Deliberately constructed by hand rather than resolved: the point
+     * is to need nothing from the container, because the container is
+     * what just failed.
+     */
+    private static function disabledManager(): TelemetryManager
+    {
+        return new TelemetryManager(
+            enabled: false,
+            registry: new Registry(new NullMetricStore, []),
+            tracer: new Tracer(sampleRate: 0.0),
+        );
+    }
+
+    private function buildManager(Application $app): TelemetryManager
+    {
+        $manager = new TelemetryManager(
+            enabled: (bool) $app->make('config')->get('telemetry.enabled'),
+            registry: $app->make(Registry::class),
+            tracer: $app->make(Tracer::class),
+            resource: $this->buildResource($app),
+            maxBufferedEvents: Cast::int($app->make('config')->get('telemetry.events.max_buffer'), 5000),
+            tailDetails: $app->make('config')->get('telemetry.traces.details.mode', 'always') === 'tail',
+            slowRequestMs: Cast::float($app->make('config')->get('telemetry.traces.details.slow_request_ms'), 1000),
+            slowSpanMs: Cast::float($app->make('config')->get('telemetry.traces.details.slow_span_ms'), 100),
+            redactor: $app->make(RedactsTelemetry::class),
+            selfMetrics: (bool) $app->make('config')->get('telemetry.self_metrics', true),
+        );
+
+        foreach ($this->buildExporters($app) as $exporter) {
+            $manager->addExporter($exporter);
+        }
+
+        return $manager;
+    }
+
+    private function registerNativeRuntime(): void
+    {
         // The optional cbox_telemetry extension. Bound even when it is
         // absent — as the null implementation, so every call site is the
         // same code with and without it, and "without it" stays testable.
@@ -287,9 +347,16 @@ class TelemetryServiceProvider extends ServiceProvider
             // when disabled (AGENTS.md invariant 6) — otherwise every query
             // would resolve TelemetryManager, its registry, resource
             // detection and the exporters, only to discard the observation.
-            $this->app->singleton('db.factory', fn (Application $app): ConnectionFactory => $app->make('config')->get('telemetry.enabled')
-                ? new InstrumentedConnectionFactory($app)
-                : new ConnectionFactory($app));
+            //
+            // extend(), not singleton(), for the same reason as `redis`
+            // below: a provider registered after this one that runs
+            // DatabaseServiceProvider::register() again — a package provider
+            // that extends it without overriding register() does exactly
+            // that — rebinds `db.factory` and would silently drop a
+            // replacement. An extender survives the rebinding.
+            $this->app->extend('db.factory', fn (mixed $factory, Application $app): mixed => $factory instanceof InstrumentedConnectionFactory || ! $app->make('config')->get('telemetry.enabled')
+                ? $factory
+                : new InstrumentedConnectionFactory($app));
         }
 
         if ($config->get('telemetry.instrument.redis_connect', true)) {
@@ -383,31 +450,62 @@ class TelemetryServiceProvider extends ServiceProvider
         }
 
         $config = $this->app->make('config');
-        $registry = $this->app->make(Registry::class);
 
-        // Only meaningful when OTLP is actually in use — the breaker is an
-        // OtlpExporter concern, and an unused gauge is just scrape noise.
-        if (in_array('otlp', (array) $config->get('telemetry.exporters', []), true)) {
-            // 1 while the per-process OTLP circuit breaker is open (recent
-            // transport failure), 0 otherwise — alert on sustained 1.
-            $registry->gauge(
-                'telemetry.export.circuit_open',
-                fn (): float => OtlpExporter::circuitOpen() ? 1.0 : 0.0,
-                description: 'OTLP export circuit breaker state (1 = open)',
-                unit: '1',
-            );
+        // Deferred, like the host provider. Resolving the Registry
+        // resolves the MetricStore, which on the Redis driver builds the
+        // store and the manager behind it — for every request, whether or
+        // not anything ever records a metric. No socket is opened, but
+        // "passive listener" means not building the machinery either
+        // until something asks.
+        $this->onRegistry(function (Registry $registry) use ($config): void {
+            // Only meaningful when OTLP is actually in use — the breaker
+            // is an OtlpExporter concern, and an unused gauge is just
+            // scrape noise.
+            if (in_array('otlp', (array) $config->get('telemetry.exporters', []), true)) {
+                // 1 while the per-process OTLP circuit breaker is open
+                // (recent transport failure), 0 otherwise — alert on
+                // sustained 1.
+                $registry->gauge(
+                    'telemetry.export.circuit_open',
+                    fn (): float => OtlpExporter::circuitOpen() ? 1.0 : 0.0,
+                    description: 'OTLP export circuit breaker state (1 = open)',
+                    unit: '1',
+                );
+            }
+
+            // Spool backlog — a climbing depth means the daemon isn't
+            // keeping up (or is down). Only meaningful when the spool is
+            // enabled.
+            if ($config->get('telemetry.otlp.spool.enabled', false)) {
+                $registry->gauge(
+                    'telemetry.spool.depth',
+                    fn (): float => (float) (FailSafe::guard(fn () => $this->app->make(Spool::class)->size()) ?? 0),
+                    description: 'Pending payloads in the OTLP spool',
+                    unit: '',
+                );
+            }
+        });
+    }
+
+    /**
+     * Run when the Registry is first built, or now if it already has
+     * been.
+     *
+     * `afterResolving` alone would miss an application that resolved it
+     * during its own boot, and `make()` alone would build it in every
+     * application that never records anything.
+     *
+     * @param  Closure(Registry): void  $register
+     */
+    private function onRegistry(Closure $register): void
+    {
+        if ($this->app->resolved(Registry::class)) {
+            $register($this->app->make(Registry::class));
+
+            return;
         }
 
-        // Spool backlog — a climbing depth means the daemon isn't keeping
-        // up (or is down). Only meaningful when the spool is enabled.
-        if ($config->get('telemetry.otlp.spool.enabled', false)) {
-            $registry->gauge(
-                'telemetry.spool.depth',
-                fn (): float => (float) (FailSafe::guard(fn () => $this->app->make(Spool::class)->size()) ?? 0),
-                description: 'Pending payloads in the OTLP spool',
-                unit: '',
-            );
-        }
+        $this->app->afterResolving(Registry::class, $register);
     }
 
     /**
@@ -502,6 +600,7 @@ class TelemetryServiceProvider extends ServiceProvider
                 redis: $app->make(RedisFactory::class),
                 connection: Cast::string($config->get('telemetry.stores.redis.connection'), 'default'),
                 prefix: Cast::string($config->get('telemetry.stores.redis.prefix'), 'telemetry'),
+                maxFields: Cast::int($config->get('telemetry.stores.redis.max_fields'), 50_000),
             ),
             'apcu' => new ApcuMetricStore(
                 prefix: Cast::string($config->get('telemetry.stores.apcu.prefix'), 'telemetry'),
@@ -535,7 +634,6 @@ class TelemetryServiceProvider extends ServiceProvider
         $resource = [
             'service.name' => Cast::string($config->get('telemetry.service.name'), 'laravel'),
             'deployment.environment.name' => Cast::string($config->get('telemetry.service.environment'), 'production'),
-            'host.name' => (string) gethostname(),
             'telemetry.sdk.name' => 'cboxdk/laravel-telemetry',
             'telemetry.sdk.language' => 'php',
             'process.runtime.name' => 'php',
@@ -549,6 +647,12 @@ class TelemetryServiceProvider extends ServiceProvider
 
         if (is_string($version = $config->get('telemetry.service.version'))) {
             $resource['service.version'] = $version;
+        }
+
+        $instanceId = $config->get('telemetry.service.instance_id');
+
+        if (is_string($instanceId) && $instanceId !== '') {
+            $resource['service.instance.id'] = $instanceId;
         }
 
         // Deployment marker: explicit config wins; otherwise the current
@@ -566,6 +670,21 @@ class TelemetryServiceProvider extends ServiceProvider
         if ($config->get('telemetry.resource_detection', true)) {
             $resource += ResourceDetector::detect();
         }
+
+        // Last, and only if nothing else said so. `host.name` used to be
+        // seeded above with `gethostname()`, and `+=` keeps what is
+        // already there — so `OTEL_RESOURCE_ATTRIBUTES=host.name=…`, the
+        // operator's explicit word and the one thing that outranks
+        // detection, could never take effect. It matters wherever the
+        // container's hostname is a random id and the real machine has a
+        // name worth reading.
+        $resource['host.name'] ??= (string) gethostname();
+
+        // Prometheus's and Mimir's OTLP receivers derive `instance` from
+        // `service.instance.id` and nothing else — without one, two hosts'
+        // counters share a series. What the default names, and why, is in
+        // ServiceInstance.
+        $resource['service.instance.id'] ??= ServiceInstance::id($config, Cast::string($resource['host.name']));
 
         return $resource;
     }
@@ -962,7 +1081,10 @@ class TelemetryServiceProvider extends ServiceProvider
             (new BusInstrumentation($this->app))->register($events);
         }
 
-        if ($config->get('telemetry.instrument.redis', false)) {
+        $redisCommands = (bool) $config->get('telemetry.instrument.redis', false);
+        $redisFailures = (bool) $config->get('telemetry.instrument.redis_failures', true);
+
+        if ($redisCommands || $redisFailures) {
             // The package's own connections are ALWAYS ignored — self-
             // instrumentation would loop (telemetry writes generating
             // spans generating writes). An explicit ignore list is
@@ -976,7 +1098,15 @@ class TelemetryServiceProvider extends ServiceProvider
             ]));
 
             $this->app->singleton(RedisInstrumentation::class);
-            $this->app->make(RedisInstrumentation::class)->register($events, $ignored);
+            $this->app->make(RedisInstrumentation::class)->register($events, $ignored, $redisCommands, $redisFailures);
+        }
+
+        $migrations = (bool) $config->get('telemetry.instrument.migrations', true);
+        $maintenance = (bool) $config->get('telemetry.instrument.maintenance_mode', true);
+        $pool = (bool) $config->get('telemetry.instrument.connection_pool', true);
+
+        if ($migrations || $maintenance || $pool) {
+            (new LifecycleInstrumentation($this->app))->register($events, $migrations, $maintenance, $pool);
         }
 
         if ($config->get('telemetry.instrument.gates', true)) {
@@ -1204,9 +1334,25 @@ class TelemetryServiceProvider extends ServiceProvider
             return;
         }
 
-        $this->app->make(TelemetryManager::class)->provider(new SystemMetricsProvider(
-            cpuInterval: Cast::float($config->get('telemetry.providers.system.cpu_interval'), 0.1),
-        ));
+        // Through a resolution hook, not `make()`. Building the manager
+        // builds the resource, which reads `.git` and probes container and
+        // environment files — I/O, during boot, in every application that
+        // has cboxdk/system-metrics installed, whether or not anything
+        // ever asks for a metric. The registration is the boot-time work;
+        // the manager can be built when something actually needs one.
+        $register = function (TelemetryManager $telemetry) use ($config): void {
+            $telemetry->provider(new SystemMetricsProvider(
+                cpuInterval: Cast::float($config->get('telemetry.providers.system.cpu_interval'), 0.1),
+            ));
+        };
+
+        if ($this->app->resolved(TelemetryManager::class)) {
+            $register($this->app->make(TelemetryManager::class));
+
+            return;
+        }
+
+        $this->app->afterResolving(TelemetryManager::class, $register);
     }
 
     /**

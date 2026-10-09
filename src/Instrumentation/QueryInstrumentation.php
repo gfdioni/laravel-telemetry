@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Cbox\Telemetry\Instrumentation;
 
+use Cbox\Telemetry\Support\DbSystem;
 use Cbox\Telemetry\Support\FailSafe;
 use Cbox\Telemetry\TelemetryManager;
 use Cbox\Telemetry\Tracing\SpanKind;
@@ -18,7 +19,25 @@ use Illuminate\Database\Events\QueryExecuted;
  */
 final class QueryInstrumentation
 {
-    private const MAX_QUERY_LENGTH = 500;
+    /**
+     * The query text is NOT cut here.
+     *
+     * It used to be, at 500 characters, and that is the same bug the
+     * span-level value cap turned out to be: redaction runs at export,
+     * so cutting
+     * `SELECT 1 /* …https://alice:hunter2@example.test/ *​/` before the
+     * `@` leaves a string the userinfo pattern no longer recognises,
+     * and the password ships. A comment in a query is not an exotic
+     * place for a connection string to appear — ORMs and migration
+     * tools put them there.
+     *
+     * Length belongs to `telemetry.redaction.max_value_length`, which
+     * redacts first and cuts after; the memory a long query occupies
+     * until then is bounded by the tracer's byte budget.
+     */
+
+    /** Distinct query fingerprints held per trace before the map resets. */
+    private const MAX_FINGERPRINTS = 10_000;
 
     private float $minDurationMs = 0.0;
 
@@ -43,6 +62,23 @@ final class QueryInstrumentation
     }
 
     private function queryExecuted(QueryExecuted $event): void
+    {
+        FailSafe::guard(fn () => $this->record($event));
+    }
+
+    /**
+     * Everything this listener does, inside one guard.
+     *
+     * Resolving the manager and asking it for the current span used to
+     * happen out here, ahead of the guard below — and this listener fires
+     * for EVERY query in the application. A container binding that throws
+     * (a store driver misconfigured, an app decorating the binding, a lazy
+     * connection that cannot be made) would therefore turn every single
+     * database query into an exception from the telemetry package. There
+     * is no failure in this package with a larger blast radius, and it
+     * was one `make()` outside a try.
+     */
+    private function record(QueryExecuted $event): void
     {
         // Resolved per event so Telemetry::fake() swaps take effect.
         $telemetry = $this->container->make(TelemetryManager::class);
@@ -92,9 +128,9 @@ final class QueryInstrumentation
                 'db.query',
                 $event->time,
                 [
-                    'db.system.name' => $event->connection->getDriverName(),
+                    'db.system.name' => DbSystem::name($event->connection->getDriverName()),
                     'laravel.db.connection' => $event->connectionName,
-                    'db.query.text' => mb_substr($event->sql, 0, self::MAX_QUERY_LENGTH),
+                    'db.query.text' => $event->sql,
                 ],
                 SpanKind::Client,
                 detail: true,
@@ -123,6 +159,20 @@ final class QueryInstrumentation
             $this->queryCounts = [];
         }
 
+        // Bounded. One trace can run an unbounded number of DISTINCT
+        // queries — a bulk import, a migration, a long job — and this map
+        // is keyed by fingerprint, so without a cap it grows for as long
+        // as the trace does. A queue worker holding one trace across a
+        // million distinct statements would carry a million entries.
+        //
+        // Clearing rather than refusing to add: N+1 detection restarts
+        // from zero, which loses nothing that matters (a query repeating
+        // enough to be a smell will repeat again) and keeps the memory
+        // flat instead of frozen at the cap with stale counts.
+        if (count($this->queryCounts) >= self::MAX_FINGERPRINTS) {
+            $this->queryCounts = [];
+        }
+
         $fingerprint = hash('xxh3', $event->connectionName.'|'.$event->sql);
         $count = ($this->queryCounts[$fingerprint] ?? 0) + 1;
         $this->queryCounts[$fingerprint] = $count;
@@ -138,9 +188,9 @@ final class QueryInstrumentation
                 ->inc(1, ['connection' => $event->connectionName]);
 
             $telemetry->event('db.query.duplicate_detected', [
-                'db.system.name' => $event->connection->getDriverName(),
+                'db.system.name' => DbSystem::name($event->connection->getDriverName()),
                 'laravel.db.connection' => $event->connectionName,
-                'db.query.text' => mb_substr($event->sql, 0, self::MAX_QUERY_LENGTH),
+                'db.query.text' => $event->sql,
                 'db.query.repeat_count' => $count,
             ]);
         });

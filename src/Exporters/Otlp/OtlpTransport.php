@@ -29,6 +29,27 @@ class OtlpTransport
     private const MAX_REPORTED_BODY = 500;
 
     /**
+     * Bytes of the response kept.
+     *
+     * A collector answers with a few hundred bytes of JSON. Something
+     * that is not a collector — a proxy error page, a captive portal, a
+     * misconfigured endpoint pointed at a file server — can answer with
+     * anything at all, and the whole of it was being buffered into the
+     * request's memory. We only ever read a partial-success count or an
+     * error message out of it, and 64KiB is far more than either needs.
+     */
+    private const MAX_RESPONSE_BYTES = 65536;
+
+    /**
+     * Longest cooldown a backend can ask for.
+     *
+     * A day. Longer than that is indistinguishable from the exporter
+     * being switched off, and an unclamped value overflows into a
+     * float when added to the clock.
+     */
+    private const MAX_RETRY_AFTER_SECONDS = 86_400;
+
+    /**
      * @param  array<string, string>  $headers
      */
     public function __construct(
@@ -76,12 +97,45 @@ class OtlpTransport
             return ExportResult::failed('curl_init failed');
         }
 
+        $rawHeaders = '';
+        $responseBody = '';
+        $truncated = false;
+
         curl_setopt_array($handle, [
             CURLOPT_POST => true,
             CURLOPT_POSTFIELDS => $body,
             CURLOPT_HTTPHEADER => $headers,
             CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_HEADER => true,
+            CURLOPT_HEADERFUNCTION => static function ($handle, string $line) use (&$rawHeaders): int {
+                // Whole lines only, and only while there is room for a
+                // whole one. Cutting a line at the bound turned
+                // `Retry-After: 120` into `Retry-After: 1` — a
+                // truncated value that still parses is worse than no
+                // value, because nothing downstream can tell.
+                if (strlen($rawHeaders) + strlen($line) <= self::MAX_RESPONSE_BYTES) {
+                    $rawHeaders .= $line;
+                }
+
+                return strlen($line);
+            },
+            CURLOPT_WRITEFUNCTION => static function ($handle, string $chunk) use (&$responseBody, &$truncated): int {
+                $length = strlen($chunk);
+
+                // Keep the first 64KiB and discard the rest, rather than
+                // returning short — a short write aborts the transfer,
+                // and curl reports that as a network error, which would
+                // trip the circuit breaker on a response that arrived
+                // perfectly well.
+                if (strlen($responseBody) < self::MAX_RESPONSE_BYTES) {
+                    $responseBody .= substr($chunk, 0, self::MAX_RESPONSE_BYTES - strlen($responseBody));
+                }
+
+                if (strlen($responseBody) >= self::MAX_RESPONSE_BYTES) {
+                    $truncated = true;
+                }
+
+                return $length;
+            },
             CURLOPT_TIMEOUT_MS => (int) ($this->timeout * 1000),
             CURLOPT_CONNECTTIMEOUT_MS => (int) ($this->connectTimeout * 1000),
             // Explicit, even though these are curl's defaults — telemetry
@@ -92,18 +146,14 @@ class OtlpTransport
 
         $response = curl_exec($handle);
         $status = (int) curl_getinfo($handle, CURLINFO_RESPONSE_CODE);
-        $headerSize = (int) curl_getinfo($handle, CURLINFO_HEADER_SIZE);
         $error = curl_error($handle);
 
-        if ($response === false || $response === true) {
-            return ExportResult::retryable("network error: {$error}");
+        if ($response === false) {
+            return ExportResult::unreachable("network error: {$error}");
         }
 
-        $rawHeaders = substr($response, 0, $headerSize);
-        $responseBody = substr($response, $headerSize);
-
         if ($status >= 200 && $status < 300) {
-            return $this->classifySuccess($responseBody);
+            return $this->classifySuccess($responseBody, $truncated);
         }
 
         if (in_array($status, [429, 502, 503, 504], true)) {
@@ -140,10 +190,25 @@ class OtlpTransport
         return "HTTP {$status}: {$body}";
     }
 
-    private function classifySuccess(string $body): ExportResult
+    private function classifySuccess(string $body, bool $truncated = false): ExportResult
     {
         /** @var array<string, mixed>|null $decoded */
         $decoded = json_decode($body, true);
+
+        // A 2xx whose body we cut does not decode, and "does not
+        // decode" must not read as "accepted everything". OTLP reports
+        // rejections inside a 200, so this is exactly where a silent
+        // partial loss would hide — the one bug the transport tests
+        // exist for. Reported as accepted, because retrying a batch
+        // the backend took would duplicate it, but the count is
+        // unknown and the reason says so.
+        //
+        // On `$truncated` alone, not on the retained bytes: a response
+        // whose first 64KiB is whitespace decodes to null and looks
+        // empty, and that is the shape an attacker picks.
+        if ($decoded === null && $truncated) {
+            return ExportResult::partial(0, 'the response was too large to read — any partial-success count in it was lost');
+        }
 
         if (is_array($decoded)) {
             foreach ($decoded as $key => $value) {
@@ -168,12 +233,38 @@ class OtlpTransport
         return ExportResult::ok();
     }
 
+    /**
+     * Retry-After, in either form RFC 9110 allows.
+     *
+     * Delay-seconds is what a collector usually sends. An HTTP-date is
+     * what a proxy or a load balancer in front of one sends, and
+     * ignoring it meant falling back to the default cooldown — which
+     * is fine when the date is soon and wrong when the operator has
+     * told us to come back in an hour.
+     */
     private function retryAfter(string $rawHeaders): ?int
     {
-        if (preg_match('/^Retry-After:\s*(\d+)/mi', $rawHeaders, $matches) === 1) {
-            return (int) $matches[1];
+        if (preg_match('/^Retry-After:\s*(\d+)\s*$/mi', $rawHeaders, $matches) === 1) {
+            // Clamped like the date form below. `Retry-After:
+            // 999999999999999999999` casts to PHP_INT_MAX, and
+            // PHP_INT_MAX + time() is a float — which then threw from
+            // the circuit breaker, out of the export path.
+            return min((int) $matches[1], self::MAX_RETRY_AFTER_SECONDS);
         }
 
-        return null;
+        if (preg_match('/^Retry-After:\s*(.+?)\s*$/mi', $rawHeaders, $matches) !== 1) {
+            return null;
+        }
+
+        $at = strtotime($matches[1]);
+
+        if ($at === false) {
+            return null;
+        }
+
+        // A date in the past means "now"; a date absurdly far out is
+        // clamped, because a cooldown longer than a day is indistinguishable
+        // from the exporter being switched off.
+        return max(0, min($at - time(), self::MAX_RETRY_AFTER_SECONDS));
     }
 }

@@ -101,6 +101,17 @@ final readonly class OtlpSerializer
             $data['parentSpanId'] = $span->parentSpanId;
         }
 
+        // OTLP's own fields for this. Without them a span that hit its
+        // limit is indistinguishable from one that had little to say,
+        // and the operator debugs the wrong thing.
+        if ($span->droppedAttributes() > 0) {
+            $data['droppedAttributesCount'] = $span->droppedAttributes();
+        }
+
+        if ($span->droppedEvents() > 0) {
+            $data['droppedEventsCount'] = $span->droppedEvents();
+        }
+
         if ($span->status() !== SpanStatus::Unset) {
             $data['status'] = array_filter([
                 'code' => $span->status()->value,
@@ -109,11 +120,12 @@ final readonly class OtlpSerializer
         }
 
         if ($span->events() !== []) {
-            $data['events'] = array_map(fn ($event): array => [
+            $data['events'] = array_map(fn ($event): array => array_filter([
                 'name' => $event->name,
                 'timeUnixNano' => (string) $event->timeUnixNano,
                 'attributes' => $this->attributes($event->attributes),
-            ], $span->events());
+                'droppedAttributesCount' => $event->droppedAttributes ?: null,
+            ], static fn ($value) => $value !== null), $span->events());
         }
 
         if ($span->links() !== []) {
@@ -144,6 +156,14 @@ final readonly class OtlpSerializer
             MetricType::Counter => $metric + ['sum' => [
                 'aggregationTemporality' => 2, // cumulative — exported from shared storage
                 'isMonotonic' => true,
+                'dataPoints' => $this->numberDataPoints($family, $now),
+            ]],
+            // A sum that may go down. `isMonotonic: false` is the whole
+            // difference, and it is the flag that tells a backend these
+            // series may be added across hosts but never rate()'d.
+            MetricType::UpDownCounter => $metric + ['sum' => [
+                'aggregationTemporality' => 2,
+                'isMonotonic' => false,
                 'dataPoints' => $this->numberDataPoints($family, $now),
             ]],
             MetricType::Gauge => $metric + ['gauge' => [

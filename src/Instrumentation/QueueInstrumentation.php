@@ -17,17 +17,29 @@ use Cbox\Telemetry\Tracing\Span;
 use Cbox\Telemetry\Tracing\SpanKind;
 use Cbox\Telemetry\Tracing\SpanLink;
 use Cbox\Telemetry\Tracing\SpanStatus;
+use Closure;
 use Illuminate\Contracts\Cache\Factory as CacheFactory;
 use Illuminate\Contracts\Cache\Repository as CacheRepository;
 use Illuminate\Contracts\Container\Container;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Queue\Events\JobAttempted;
+use Illuminate\Queue\Events\JobDebounced;
 use Illuminate\Queue\Events\JobFailed;
+use Illuminate\Queue\Events\JobInterrupted;
 use Illuminate\Queue\Events\JobProcessed;
 use Illuminate\Queue\Events\JobProcessing;
 use Illuminate\Queue\Events\JobReleasedAfterException;
+use Illuminate\Queue\Events\JobRetryRequested;
 use Illuminate\Queue\Events\JobTimedOut;
 use Illuminate\Queue\Events\QueueBusy;
+use Illuminate\Queue\Events\QueueFailedOver;
+use Illuminate\Queue\Events\UniqueJobSkipped;
+use Illuminate\Queue\Events\WorkerInterrupted;
+use Illuminate\Queue\Events\WorkerPausing;
+use Illuminate\Queue\Events\WorkerQueuePaused;
+use Illuminate\Queue\Events\WorkerQueueResumed;
+use Illuminate\Queue\Events\WorkerResuming;
+use Illuminate\Queue\Events\WorkerStarting;
 use Illuminate\Queue\Events\WorkerStopping;
 use Illuminate\Queue\QueueManager;
 use Throwable;
@@ -71,7 +83,7 @@ final class QueueInstrumentation implements ManagesRequestState
      * told about and not somebody else's — and can tell an attempt that
      * reported an outcome from one that never did.
      *
-     * @var array<int, int> job object id => span object id
+     * @var array<string, int> attempt key => span object id
      */
     private array $attemptSpans = [];
 
@@ -149,13 +161,23 @@ final class QueueInstrumentation implements ManagesRequestState
     {
         if ($propagate) {
             $queue->createPayloadUsing(function (?string $connection = null, ?string $queueName = null, array $payload = []) {
-                $telemetry = $this->telemetry();
+                // Resolved inside the guard. This runs on DISPATCH, and
+                // PendingDispatch::__destruct() dispatches — so a
+                // telemetry failure out here does not lose a metric, it
+                // loses the job, from a destructor.
+                $telemetry = FailSafe::guard(fn (): TelemetryManager => $this->telemetry());
+
+                if ($telemetry === null) {
+                    return [];
+                }
 
                 FailSafe::guard(fn () => $telemetry
                     ->counter('queue.jobs.dispatched', 'Jobs pushed onto the queue')
                     ->inc(1, [
-                        'job.name' => is_string($payload['displayName'] ?? null) ? $payload['displayName'] : 'unknown',
-                        'queue' => $queueName ?? 'default',
+                        'job.name' => $telemetry->classifyJob(
+                            is_string($payload['displayName'] ?? null) ? $payload['displayName'] : null,
+                        ),
+                        'queue' => $telemetry->classifyQueue($queueName),
                     ]));
 
                 // Carry the full context: trace position, ambient custom
@@ -187,13 +209,7 @@ final class QueueInstrumentation implements ManagesRequestState
                     // then SIGKILLs the worker, so nothing else will ever close
                     // this attempt. The trace for a timed-out job — exactly the
                     // job you went looking for — was simply absent.
-                    $this->completeJob(
-                        $event->job->resolveName(),
-                        $event->job->getQueue(),
-                        'timed_out',
-                        $event->connectionName === 'sync',
-                        $event->job,
-                    );
+                    $this->closeAttempt($event->job, $event->connectionName, 'timed_out');
                 });
             }
 
@@ -236,9 +252,107 @@ final class QueueInstrumentation implements ManagesRequestState
             $events->listen(QueueBusy::class, function ($event) {
                 FailSafe::guard(fn () => $this->telemetry()
                     ->gauge('queue.size', description: 'Queue depth reported by queue:monitor', unit: '{jobs}')
-                    ->set((float) $event->size, ['connection' => $event->connection, 'queue' => $event->queue]));
+                    ->set((float) $event->size, [
+                        'connection' => $event->connection,
+                        'queue' => $this->telemetry()->classifyQueue($event->queue),
+                    ]));
             });
+
+            // A connection that failed over. The dispatch succeeded, so
+            // nothing upstream noticed — and the jobs are now on a queue
+            // nobody is watching. Same shape as the cache failover: the
+            // application handled it too well to tell anyone.
+            $this->tally($events, QueueFailedOver::class, 'failed_over', static fn (object $e): array => [
+                'connection' => is_string($e->connectionName ?? null) ? $e->connectionName : 'default',
+                'error.type' => ($e->exception ?? null) instanceof Throwable ? $e->exception::class : 'unknown',
+            ]);
+
+            // Work that did not happen, and does not look like a failure.
+            // A unique lock or a debounce window suppressing every
+            // dispatch is indistinguishable from an idle queue, right up
+            // until someone asks why the emails stopped.
+            $this->tally($events, UniqueJobSkipped::class, 'unique_skipped', $this->jobLabels(...));
+            $this->tally($events, JobDebounced::class, 'debounced', $this->jobLabels(...));
+
+            // An attempt a signal cut short. The worker was told to stop
+            // mid-job; the job is neither processed nor failed, and
+            // without this the attempt simply vanishes.
+            $this->tally($events, JobInterrupted::class, 'interrupted', $this->jobLabels(...));
+
+            // Operator-requested replay, which is not an automatic retry
+            // and should not be read as one.
+            $this->tally($events, JobRetryRequested::class, 'retry_requested', static fn (object $e): array => [
+                'connection' => 'unknown',
+                'queue' => 'unknown',
+            ]);
+
+            // Why processing stopped and started. Horizon has its own
+            // state for this; a plain worker has nothing, so a queue that
+            // went quiet at 02:00 is a mystery rather than a maintenance
+            // pause.
+            foreach ([
+                WorkerStarting::class => 'starting',
+                WorkerPausing::class => 'pausing',
+                WorkerResuming::class => 'resuming',
+                WorkerQueuePaused::class => 'queue_paused',
+                WorkerQueueResumed::class => 'queue_resumed',
+                WorkerInterrupted::class => 'interrupted',
+            ] as $event => $transition) {
+                $this->tally($events, $event, $transition, fn (object $e): array => [
+                    'connection' => is_string($e->connectionName ?? null) ? $e->connectionName : 'default',
+                    'queue' => $this->telemetry()->classifyQueue(is_string($e->queue ?? null) ? $e->queue : null),
+                ], counter: 'queue.worker.transitions', label: 'transition');
+            }
         }
+    }
+
+    /**
+     * Labels for an event that carries a `job` — the ones that do not all
+     * carry it the same way, so this reads defensively.
+     *
+     * @return array<string, scalar|null>
+     */
+    private function jobLabels(object $event): array
+    {
+        $job = $event->job ?? null;
+
+        return [
+            'job.name' => $this->telemetry()->classifyJob(
+                is_object($job) && method_exists($job, 'resolveName') ? $job->resolveName() : null,
+            ),
+            'queue' => $this->telemetry()->classifyQueue(
+                is_object($job) && method_exists($job, 'getQueue') ? $job->getQueue() : null,
+            ),
+        ];
+    }
+
+    /**
+     * Count an event that may not exist on this Laravel version.
+     *
+     * The package supports two majors and several of these arrived in the
+     * newer one. Listening for a class that does not exist is harmless —
+     * nothing dispatches it — but a typed closure parameter would not be,
+     * so the handler takes `object`.
+     *
+     * @param  Closure(object): array<string, scalar|null>  $labels
+     */
+    private function tally(
+        Dispatcher $events,
+        string $event,
+        string $outcome,
+        Closure $labels,
+        string $counter = 'queue.jobs',
+        string $label = 'outcome',
+    ): void {
+        if (! class_exists($event)) {
+            return;
+        }
+
+        $events->listen($event, function (object $fired) use ($labels, $counter, $label, $outcome) {
+            FailSafe::guard(fn () => $this->telemetry()
+                ->counter($counter, 'Queue lifecycle events')
+                ->inc(1, [...$labels($fired), $label => $outcome]));
+        });
     }
 
     private function jobProcessing(JobProcessing $event): void
@@ -288,11 +402,17 @@ final class QueueInstrumentation implements ManagesRequestState
 
                 $attributes['messaging.wait_time_ms'] = round($waitMs, 2);
 
+                // Its own ladder, reaching ten minutes. The default stops
+                // at 10s, and for a CLASSIC histogram a quantile that
+                // lands in `+Inf` reports the highest finite bound — so a
+                // queue uniformly an hour behind answered p95 = 10, and
+                // the shipped "wait time over 30s" alert could not fire
+                // no matter how bad the backlog got.
                 $this->telemetry()
-                    ->histogram('queue.job.wait_time', description: 'Time from dispatch until the attempt started', unit: 'ms')
-                    ->record($waitMs, [
-                        'job.name' => $event->job->resolveName(),
-                        'queue' => $event->job->getQueue() ?? 'default',
+                    ->histogram('queue.job.wait_time', buckets: [0.05, 0.1, 0.5, 1, 5, 10, 30, 60, 120, 300, 600], description: 'Time from dispatch until the attempt started', unit: 's')
+                    ->record($waitMs / 1000, [
+                        'job.name' => $this->telemetry()->classifyJob($event->job->resolveName()),
+                        'queue' => $this->telemetry()->classifyQueue($event->job->getQueue()),
                     ]);
             }
 
@@ -304,7 +424,17 @@ final class QueueInstrumentation implements ManagesRequestState
             );
 
             $this->jobSpans[] = $span;
-            $this->attemptSpans[spl_object_id($event->job)] = spl_object_id($span);
+            // A uuid identifies one attempt. If one is somehow already
+            // open under this key — a job that dispatched itself
+            // synchronously — the object id keeps the two apart rather
+            // than the second overwriting the first's ownership.
+            $key = self::attemptKey($event->job);
+
+            if (isset($this->attemptSpans[$key])) {
+                $key = 'obj:'.spl_object_id($event->job);
+            }
+
+            $this->attemptSpans[$key] = spl_object_id($span);
 
             $this->telemetry()->publishTraceContext();
 
@@ -370,12 +500,54 @@ final class QueueInstrumentation implements ManagesRequestState
 
     private function jobProcessed(JobProcessed $event): void
     {
+        // A job its middleware put back — rate limited, overlapping,
+        // debounced — is released DURING fire(), and Laravel raises
+        // JobProcessed before JobReleased regardless. Counting it as
+        // processed credited the queue with work it deliberately did not
+        // do: a rate limiter throttling everything to a trickle looked
+        // like a healthy throughput of very fast jobs.
+        //
+        // `deferred`, not `released`: `released` already means "threw and
+        // will be retried", and a deferral is not a failure.
+        $this->closeAttempt($event->job, $event->connectionName);
+    }
+
+    /**
+     * Close an attempt, reading what it is from the job itself.
+     *
+     * The job is a THIRD-PARTY object — a custom queue driver, a wrapper,
+     * a decorator — and `resolveName()`, `getQueue()` and `isReleased()`
+     * are three calls into it. Evaluating them as arguments put them
+     * outside every guard, so a driver that throws from any of them (or
+     * predates `isReleased()` on the contract) would fail the job with an
+     * exception from the telemetry package. Reading them inside one guard
+     * means a hostile job costs one report and an attempt named
+     * `unknown`, not a failed job.
+     *
+     * One guard, not three: a job that throws from all of them would
+     * otherwise report three times per attempt, and a logging storm is
+     * its own outage.
+     *
+     * The span is closed either way. Skipping the close on failure would
+     * leave it open AND ambient, and everything the worker did next would
+     * become its child — a swallowed error silently rewriting the shape
+     * of every later trace.
+     */
+    private function closeAttempt(object $job, ?string $connectionName, ?string $outcome = null): void
+    {
+        /** @var array{0: string, 1: string|null, 2: bool} $facts */
+        $facts = FailSafe::guard(static fn (): array => [
+            method_exists($job, 'resolveName') ? (string) $job->resolveName() : 'unknown',
+            method_exists($job, 'getQueue') ? $job->getQueue() : null,
+            method_exists($job, 'isReleased') && $job->isReleased(),
+        ]) ?? ['unknown', null, false];
+
         $this->completeJob(
-            job: $event->job->resolveName(),
-            queue: $event->job->getQueue(),
-            outcome: 'processed',
-            sync: $event->connectionName === 'sync',
-            attempt: $event->job,
+            job: $facts[0],
+            queue: $facts[1],
+            outcome: $outcome ?? ($facts[2] ? 'deferred' : 'processed'),
+            sync: $connectionName === 'sync',
+            attempt: $job,
         );
     }
 
@@ -424,12 +596,7 @@ final class QueueInstrumentation implements ManagesRequestState
             $this->rememberFailureContext($releasedBy);
         }
 
-        $this->completeJob(
-            job: $event->job->resolveName(),
-            queue: $event->job->getQueue(),
-            outcome: 'released',
-            sync: $event->connectionName === 'sync',
-        );
+        $this->closeAttempt($event->job, $event->connectionName, 'released');
     }
 
     private function jobFailed(JobFailed $event): void
@@ -438,13 +605,7 @@ final class QueueInstrumentation implements ManagesRequestState
 
         $this->rememberFailureContext($event->exception);
 
-        $this->completeJob(
-            job: $event->job->resolveName(),
-            queue: $event->job->getQueue(),
-            outcome: 'failed',
-            sync: $event->connectionName === 'sync',
-            attempt: $event->job,
-        );
+        $this->closeAttempt($event->job, $event->connectionName, 'failed');
     }
 
     private function completeJob(string $job, ?string $queue, string $outcome, bool $sync, ?object $attempt = null): void
@@ -457,16 +618,53 @@ final class QueueInstrumentation implements ManagesRequestState
             $this->completedAttempts[$attempt] = true;
         }
 
-        FailSafe::guard(function () use ($job, $queue, $outcome) {
+        // Detach FIRST, outside the guard and before anything fallible.
+        // Classifying the labels resolves the manager, and resolving
+        // the manager can throw — so the very first thing this method
+        // did was something that could leave every map still holding
+        // this span's entries. Nothing below can fail before the
+        // release now, because the release is above it.
+        // THIS attempt's span, not whatever is on top of the stack.
+        // A sync dispatch inside a job nests, so the stack holds the
+        // outer job's span too — and an inner attempt that never
+        // acquired one of its own used to pop the outer one, ending it
+        // early and recording its duration against the inner job's
+        // outcome.
+        $span = $this->spanFor($attempt);
+        $usage = null;
+        $unit = null;
+        $profile = null;
+
+        if ($span !== null) {
+            $id = spl_object_id($span);
+
+            if (($owner = array_search($id, $this->attemptSpans, true)) !== false) {
+                unset($this->attemptSpans[$owner]);
+            }
+
+            $usage = $this->jobUsage[$id] ?? null;
+            $unit = $this->jobUnits[$id] ?? null;
+            $profile = $this->jobProfiles[$id] ?? null;
+
+            unset($this->jobUsage[$id], $this->jobUnits[$id], $this->jobProfiles[$id]);
+        }
+
+        $reported = false;
+
+        FailSafe::guard(function () use ($job, $queue, $outcome, $span, $usage, $unit, $profile, &$reported) {
             // "job.name", not "job" — a bare `job` label collides with
             // Prometheus' reserved scrape-job label and gets overwritten
             // by collectors.
-            $labels = ['job.name' => $job, 'queue' => $queue ?? 'default'];
+            // Classified: Laravel lets a queue be named at dispatch
+            // time, so `->onQueue("tenant-{$id}")` is one permanent
+            // series per tenant on every metric below — several of them
+            // histograms. See TelemetryManager::classifyQueuesUsing().
+            $labels = [
+                'job.name' => $this->telemetry()->classifyJob($job),
+                'queue' => $this->telemetry()->classifyQueue($queue),
+            ];
 
-            if ($span = array_pop($this->jobSpans)) {
-                if (($owner = array_search(spl_object_id($span), $this->attemptSpans, true)) !== false) {
-                    unset($this->attemptSpans[$owner]);
-                }
+            if ($span !== null) {
 
                 if ($span->status() === SpanStatus::Unset) {
                     $span->setStatus($outcome === 'processed' ? SpanStatus::Ok : SpanStatus::Error);
@@ -478,9 +676,6 @@ final class QueueInstrumentation implements ManagesRequestState
                     // occurrence, rather than in a metric label.
                     $span->setAttribute('queue.job.outcome', self::OUTCOME_ABANDONED);
                 }
-
-                $usage = $this->jobUsage[spl_object_id($span)] ?? null;
-                unset($this->jobUsage[spl_object_id($span)]);
 
                 if ($usage !== null) {
                     $measured = $usage->measure();
@@ -497,14 +692,11 @@ final class QueueInstrumentation implements ManagesRequestState
                         ->record((float) $measured['memoryPeakBytes'], $labels);
 
                     $this->telemetry()
-                        ->histogram('queue.job.cpu.time', description: 'CPU time per job', unit: 'ms')
-                        ->record($measured['cpuTimeMs'], $labels);
+                        ->histogram('queue.job.cpu.time', description: 'CPU time per job', unit: 's')
+                        ->record($measured['cpuTimeMs'] / 1000, $labels);
                 }
 
                 // Before end() — see the ordering note in TraceRequest.
-                $unit = $this->jobUnits[spl_object_id($span)] ?? null;
-                unset($this->jobUnits[spl_object_id($span)]);
-
                 if ($unit !== null) {
                     $result = $unit->finish($this->telemetry()->tracer()->currentlySampled($span));
 
@@ -518,16 +710,17 @@ final class QueueInstrumentation implements ManagesRequestState
 
                 $span->end();
 
-                $profile = $this->jobProfiles[spl_object_id($span)] ?? null;
-                unset($this->jobProfiles[spl_object_id($span)]);
-
                 if ($profile !== null) {
+                    $reported = true;
                     $this->reportProfile($profile, $span->durationMs(), $job, $queue ?? 'default');
                 }
 
+                // Likewise: a job is allowed to take minutes, and the
+                // default ladder would report every long one as exactly
+                // ten seconds.
                 $this->telemetry()
-                    ->histogram('queue.job.duration', description: 'Queue job processing duration', unit: 'ms')
-                    ->record($span->durationMs(), $labels);
+                    ->histogram('queue.job.duration', buckets: [0.01, 0.05, 0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 300, 600], description: 'Queue job processing duration', unit: 's')
+                    ->record($span->durationMs() / 1000, $labels);
             }
 
             // No counter for an attempt Laravel reported no outcome for.
@@ -542,6 +735,33 @@ final class QueueInstrumentation implements ManagesRequestState
                     ->inc(1, $labels);
             }
         });
+
+        // Disposal, in guards of its own, AFTER the reporting above.
+        //
+        // Detaching the maps stopped the leak but not the rest of it:
+        // the reporting guard can throw at its first line — resolving
+        // the manager is enough — and then the span was never ended
+        // and the native unit never closed. `schedule:run` and a queue
+        // worker both run the next unit of work in the same process,
+        // and an unclosed native unit means every one after this is
+        // refused. The backstop cannot help, because the ownership it
+        // looks for was already released.
+        //
+        // Each in its own guard so one failing does not skip the next.
+        if ($unit !== null) {
+            FailSafe::guard(static fn () => $unit->discard());
+        }
+
+        // Only when reporting did not already consume it: stop()
+        // obtains, aggregates and sorts the log, and doing that twice
+        // is the profiler's whole cost paid twice on the happy path.
+        if ($profile !== null && ! $reported) {
+            FailSafe::guard(static fn () => $profile->stop(0));
+        }
+
+        if ($span !== null && ! $span->hasEnded()) {
+            FailSafe::guard(static fn () => $span->end());
+        }
 
         if (! $sync) {
             // Worker self-report: the process' CURRENT memory after each job.
@@ -558,7 +778,7 @@ final class QueueInstrumentation implements ManagesRequestState
             // day. The distribution answers the same question without needing
             // to know which process asked it.
             FailSafe::guard(function () use ($queue) {
-                $labels = ['queue' => $queue ?? 'default'];
+                $labels = ['queue' => $this->telemetry()->classifyQueue($queue)];
 
                 $this->telemetry()
                     ->histogram('queue.worker.memory.php', buckets: [16777216, 33554432, 67108864, 134217728, 268435456, 536870912, 1073741824, 2147483648], description: 'Worker PHP allocator usage after each job', unit: 'By')
@@ -610,7 +830,7 @@ final class QueueInstrumentation implements ManagesRequestState
      */
     private function closeAbandonedAttempt(object $job, string $connectionName): void
     {
-        $owner = spl_object_id($job);
+        $owner = self::attemptKey($job);
 
         // Already closed by an outcome event — every ordinary attempt, since
         // JobAttempted fires after JobProcessed/JobFailed, not instead.
@@ -618,15 +838,7 @@ final class QueueInstrumentation implements ManagesRequestState
             return;
         }
 
-        if (method_exists($job, 'resolveName') && method_exists($job, 'getQueue')) {
-            $this->completeJob(
-                job: $job->resolveName(),
-                queue: $job->getQueue(),
-                outcome: self::OUTCOME_ABANDONED,
-                sync: $connectionName === 'sync',
-                attempt: $job,
-            );
-        }
+        $this->closeAttempt($job, $connectionName, self::OUTCOME_ABANDONED);
 
         // Still here means completeJob declined: the attempt was marked
         // complete by an outcome event whose teardown then threw and was
@@ -640,10 +852,20 @@ final class QueueInstrumentation implements ManagesRequestState
         unset($this->attemptSpans[$owner]);
 
         $unit = $this->jobUnits[$spanId] ?? null;
-        unset($this->jobUnits[$spanId]);
+        $profile = $this->jobProfiles[$spanId] ?? null;
+
+        // Every map, not just the two the first version of this
+        // remembered. The backstop exists precisely for the case where
+        // teardown failed partway through — leaving the usage baseline
+        // and the profiler behind is the leak it was written to stop.
+        unset($this->jobUnits[$spanId], $this->jobProfiles[$spanId], $this->jobUsage[$spanId]);
 
         if ($unit !== null) {
             FailSafe::guard(static fn () => $unit->discard());
+        }
+
+        if ($profile !== null) {
+            FailSafe::guard(static fn () => $profile->stop(0));
         }
 
         foreach ($this->jobSpans as $span) {
@@ -678,6 +900,60 @@ final class QueueInstrumentation implements ManagesRequestState
         foreach ($units as $unit) {
             FailSafe::guard(static fn () => $unit->discard());
         }
+    }
+
+    /**
+     * What identifies an attempt across the events that report it.
+     *
+     * The job's uuid when it has one, because Laravel does not always
+     * hand the same job INSTANCE to every event of one attempt — and
+     * object identity then loses track of a span mid-attempt. The
+     * object id is the fallback for a job with no uuid (a raw payload,
+     * a custom queue driver).
+     */
+    private static function attemptKey(object $job): string
+    {
+        $uuid = FailSafe::guard(static fn (): ?string => method_exists($job, 'uuid') ? $job->uuid() : null);
+
+        return is_string($uuid) && $uuid !== '' ? 'uuid:'.$uuid : 'obj:'.spl_object_id($job);
+    }
+
+    /**
+     * The span this attempt owns, removed from the open stack.
+     *
+     * Falls back to the top of the stack only when the caller gave no
+     * attempt to identify — the Octane/NativePHP resets, which are
+     * closing everything anyway.
+     */
+    private function spanFor(?object $attempt): ?Span
+    {
+        $wanted = $attempt !== null ? ($this->attemptSpans[self::attemptKey($attempt)] ?? null) : null;
+
+        if ($wanted === null) {
+            // No ownership record at all: this attempt never opened a
+            // span, so it takes none. Popping the stack here is what
+            // ended the OUTER job's span when a sync child completed
+            // inside it.
+            //
+            // Only a caller with no attempt to identify — the
+            // Octane/NativePHP resets, which close everything — falls
+            // back to the top of the stack.
+            return $attempt === null ? array_pop($this->jobSpans) : null;
+        }
+
+        foreach ($this->jobSpans as $index => $open) {
+            if (spl_object_id($open) !== $wanted) {
+                continue;
+            }
+
+            $remaining = $this->jobSpans;
+            unset($remaining[$index]);
+            $this->jobSpans = array_values($remaining);
+
+            return $open;
+        }
+
+        return null;
     }
 
     private function currentJobSpan(): ?Span

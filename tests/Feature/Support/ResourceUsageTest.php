@@ -73,6 +73,7 @@ it('records job resource usage on worker jobs', function () {
 
     $job = Mockery::mock(Job::class);
     $job->shouldReceive('resolveName')->andReturn('App\Jobs\HeavyJob');
+    $job->shouldReceive('isReleased')->andReturn(false);
     $job->shouldReceive('getQueue')->andReturn('default');
     $job->shouldReceive('attempts')->andReturn(1);
     $job->shouldReceive('payload')->andReturn([]);
@@ -105,6 +106,12 @@ it('captures real process RSS and cpu utilization via cboxdk/system-metrics', fu
     if (! ProcessMetrics::snapshot($pid)->isSuccess()) {
         $this->markTestSkipped('ProcessMetrics has no source for this platform.');
     }
+
+    // Asked for explicitly, because it is no longer taken by default on
+    // a platform where taking it means spawning `ps`. The feature still
+    // works and still lands on the span — that is what this asserts;
+    // what changed is only whether it is taken without being asked.
+    config()->set('telemetry.instrument.resources_process', true);
 
     Route::get('/rss', fn () => str_repeat('z', 500_000));
 

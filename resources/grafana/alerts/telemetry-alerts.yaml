@@ -121,15 +121,15 @@ groups:
         expr: |
           histogram_quantile(0.95,
             sum by (le, service_name, deployment_environment_name) (
-              rate(queue_job_wait_time_milliseconds_bucket[5m])
+              rate(queue_job_wait_time_seconds_bucket[5m])
             )
-          ) > 30000
+          ) > 30
         for: 10m
         labels:
           severity: warning
         annotations:
           summary: "Queue backlog on {{ $labels.service_name }} ({{ $labels.deployment_environment_name }})"
-          description: "p95 job wait time is {{ printf \"%.0f\" $value }}ms over 5m (threshold 30s) — workers are behind."
+          description: "p95 job wait time is {{ printf \"%.0f\" $value }}s over 5m (threshold 30s) — workers are behind."
 
       - alert: ScheduledTaskFailing
         expr: |

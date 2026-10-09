@@ -116,6 +116,57 @@ it('sends small batches uncompressed', function () {
     expect($this->server->requests()[0]['encoding'])->toBe('');
 });
 
+it('does not buffer an endpoint that answers with a gigabyte', function () {
+    // Not a collector: a proxy error page, a captive portal, an
+    // endpoint pointed at a file server. Whatever it is, the response
+    // lands in the memory of a live application request, and the only
+    // thing read out of it is an error message.
+    $this->server = StubOtlpServer::start(500, str_repeat('x', 4 * 1024 * 1024));
+
+    // The peak, not the difference: the whole response is freed when
+    // post() returns, so before/after would measure nothing at all and
+    // pass against the unbounded version.
+    $before = memory_get_usage();
+    memory_reset_peak_usage();
+
+    $result = transportFor($this->server)->post('/v1/traces', ['resourceSpans' => []]);
+
+    expect($result->success)->toBeFalse()
+        ->and(memory_get_peak_usage() - $before)->toBeLessThan(1024 * 1024)
+        ->and($result->reason)->toContain('HTTP 500');
+});
+
+it('does not read a truncated 200 as a clean accept', function () {
+    // OTLP reports rejections INSIDE a 200. A response too large to
+    // read does not decode, and "does not decode" must not become
+    // "accepted everything" — that is the silent partial loss these
+    // tests exist for.
+    $body = json_encode([
+        'partialSuccess' => [
+            'rejectedSpans' => '7',
+            'errorMessage' => str_repeat('x', 200_000),
+        ],
+    ], JSON_THROW_ON_ERROR);
+
+    $this->server = StubOtlpServer::start(200, $body);
+
+    $result = transportFor($this->server)->post('/v1/traces', ['resourceSpans' => []]);
+
+    expect($result->success)->toBeTrue()
+        ->and($result->reason)->toContain('too large to read');
+});
+
+it('still reads a partial success that fits', function () {
+    $this->server = StubOtlpServer::start(200, json_encode([
+        'partialSuccess' => ['rejectedSpans' => '7', 'errorMessage' => 'bad resource'],
+    ], JSON_THROW_ON_ERROR));
+
+    $result = transportFor($this->server)->post('/v1/traces', ['resourceSpans' => []]);
+
+    expect($result->rejected)->toBe(7)
+        ->and($result->reason)->toBe('bad resource');
+});
+
 function freeLoopbackPort(): int
 {
     $socket = stream_socket_server('tcp://127.0.0.1:0', $errno, $error);
@@ -124,3 +175,49 @@ function freeLoopbackPort(): int
 
     return (int) substr($name, (int) strrpos($name, ':') + 1);
 }
+
+it('reads Retry-After in both forms RFC 9110 allows', function (string $header, int $atLeast, int $atMost) {
+    $transport = new OtlpTransport('http://unused:4318');
+    $method = new ReflectionMethod(OtlpTransport::class, 'retryAfter');
+
+    $seconds = $method->invoke($transport, "HTTP/1.1 503 Service Unavailable\r\nRetry-After: {$header}\r\n\r\n");
+
+    expect($seconds)->toBeGreaterThanOrEqual($atLeast)
+        ->and($seconds)->toBeLessThanOrEqual($atMost);
+})->with([
+    // Delay-seconds: what a collector sends.
+    'seconds' => ['120', 120, 120],
+    // HTTP-date: what a proxy in front of one sends. Ignoring it fell
+    // back to the default cooldown, which is wrong in both directions.
+    'http date' => [gmdate('D, d M Y H:i:s \G\M\T', time() + 300), 295, 300],
+    'http date in the past' => [gmdate('D, d M Y H:i:s \G\M\T', time() - 300), 0, 0],
+]);
+
+it('ignores a Retry-After it cannot make sense of', function () {
+    $transport = new OtlpTransport('http://unused:4318');
+    $method = new ReflectionMethod(OtlpTransport::class, 'retryAfter');
+
+    expect($method->invoke($transport, "HTTP/1.1 503 x\r\nRetry-After: soon please\r\n\r\n"))->toBeNull();
+});
+
+it('does not let a truncated header parse as a smaller value', function () {
+    // Cutting a header line at the bound turned `Retry-After: 120`
+    // into `Retry-After: 1`. A truncated value that still parses is
+    // worse than none, because nothing downstream can tell.
+    $transport = new OtlpTransport('http://unused:4318');
+    $method = new ReflectionMethod(OtlpTransport::class, 'retryAfter');
+
+    expect($method->invoke($transport, "HTTP/1.1 503 x\r\nRetry-After: 1"))->toBe(1)
+        ->and($method->invoke($transport, "HTTP/1.1 503 x\r\nRetry-After: 120\r\n"))->toBe(120);
+});
+
+it('does not read a 200 padded with whitespace as a clean accept', function () {
+    // The shape an attacker picks: the retained bytes are blank, so a
+    // check on the body rather than on the truncation flag lets it
+    // through as success.
+    $this->server = StubOtlpServer::start(200, str_repeat(' ', 70_000).'{"partialSuccess":{"rejectedSpans":"42"}}');
+
+    $result = transportFor($this->server)->post('/v1/traces', ['resourceSpans' => []]);
+
+    expect($result->reason)->toContain('too large to read');
+});

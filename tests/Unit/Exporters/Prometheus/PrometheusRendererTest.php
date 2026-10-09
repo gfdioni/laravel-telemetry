@@ -52,14 +52,28 @@ it('suffixes the name with the unit, before _total', function () {
         ),
         // Unitless stays bare.
         new MetricFamily(
-            new MetricDefinition('cache.size', MetricType::Gauge, unit: '1'),
+            // A gauge of a dimensionless `1` is a ratio in the OTLP
+            // translation, and gets the suffix. A count is not: it wants a
+            // braced annotation unit, which carries no suffix at all.
+            new MetricDefinition('memory.utilization', MetricType::Gauge, unit: '1'),
+            [new Sample([], 0.9)],
+        ),
+        new MetricFamily(
+            new MetricDefinition('cache.entries', MetricType::Gauge, unit: '{entry}'),
             [new Sample([], 9.0)],
+        ),
+        new MetricFamily(
+            // Only a gauge: a dimensionless counter is a count, not a ratio.
+            new MetricDefinition('retries', MetricType::Counter, unit: '1'),
+            [new Sample([], 4.0)],
         ),
     ]);
 
     expect($output)->toContain("memory_peak_bytes 1024\n")
         ->toContain("job_time_milliseconds_total 3\n")
-        ->toContain("cache_size 9\n");
+        ->toContain("memory_utilization_ratio 0.9\n")
+        ->toContain("cache_entries 9\n")
+        ->toContain("retries_total 4\n");
 });
 
 it('accumulates histogram buckets into cumulative le form', function () {
@@ -242,15 +256,46 @@ it('never declares one family name with two types', function () {
 });
 
 it('refuses to merge two families whose units disagree', function () {
-    // `latency` in seconds and `latency_seconds` in microseconds render to one
-    // name; merging them would report microseconds under a seconds suffix.
+    // `latency` in seconds and an unqualified `latency_seconds` render to
+    // one name; merging them would put an unknown unit under a seconds
+    // suffix.
     $output = (new PrometheusRenderer)->render([
         new MetricFamily(new MetricDefinition('latency', MetricType::Gauge, 'Seconds', 's'), [new Sample(['a' => '1'], 1.0)]),
-        new MetricFamily(new MetricDefinition('latency_seconds', MetricType::Gauge, 'Micros', 'us'), [new Sample(['a' => '2'], 999.0)]),
+        new MetricFamily(new MetricDefinition('latency_seconds', MetricType::Gauge, 'Unitless'), [new Sample(['a' => '2'], 999.0)]),
     ]);
 
     expect(substr_count($output, '# TYPE latency_seconds'))->toBe(1)
         ->and($output)->not->toContain('999');
+});
+
+it('does not append a suffix the name already carries', function () {
+    // The translation spec says to ADD the suffix when it is missing.
+    // Appending unconditionally produced `request_duration_seconds_seconds`
+    // and, for a counter someone had already named `_total`, a second one.
+    $output = (new PrometheusRenderer)->render([
+        new MetricFamily(new MetricDefinition('request.duration.seconds', MetricType::Gauge, '', 's'), [new Sample([], 1.0)]),
+        new MetricFamily(new MetricDefinition('cache.hit_ratio', MetricType::Gauge, '', '1'), [new Sample([], 0.9)]),
+        new MetricFamily(new MetricDefinition('jobs.processed_total', MetricType::Counter, ''), [new Sample([], 3.0)]),
+    ]);
+
+    expect($output)->toContain('request_duration_seconds 1')
+        ->not->toContain('_seconds_seconds')
+        ->and($output)->toContain('cache_hit_ratio 0.9')
+        ->not->toContain('_ratio_ratio')
+        ->and($output)->toContain('jobs_processed_total 3')
+        ->not->toContain('_total_total');
+});
+
+it('keeps microseconds and nanoseconds apart', function () {
+    // Both used to render under the bare name: two families claiming one
+    // series with values a thousand apart, and the second silently gone.
+    $output = (new PrometheusRenderer)->render([
+        new MetricFamily(new MetricDefinition('op.time', MetricType::Gauge, '', 'us'), [new Sample([], 5.0)]),
+        new MetricFamily(new MetricDefinition('op.other', MetricType::Gauge, '', 'ns'), [new Sample([], 7.0)]),
+    ]);
+
+    expect($output)->toContain('op_time_microseconds 5')
+        ->toContain('op_other_nanoseconds 7');
 });
 
 it('renders one labelset once however its keys were ordered', function () {
@@ -390,4 +435,30 @@ it('renders a large family without quadratic collision checking', function () {
 
     expect(substr_count($output, '# TYPE '))->toBe(10_000)
         ->and($elapsed)->toBeLessThan(2.0);
+});
+
+it('renders an up-down counter as a gauge, with no _total', function () {
+    // Prometheus has no up-down counter; the OTLP translation maps a
+    // non-monotonic sum onto a gauge. The distinction is not lost — it
+    // survives in the OTLP payload, which is where it can.
+    $output = (new PrometheusRenderer)->render([
+        new MetricFamily(
+            new MetricDefinition('system.memory.usage', MetricType::UpDownCounter, 'Memory in use', 'By'),
+            [new Sample(['system.memory.state' => 'used'], 512.0)],
+        ),
+    ]);
+
+    expect($output)->toContain('# TYPE system_memory_usage_bytes gauge')
+        ->not->toContain('_total');
+});
+
+it('gives a dimensionless up-down counter the _ratio suffix, like the gauge it becomes', function () {
+    $output = (new PrometheusRenderer)->render([
+        new MetricFamily(
+            new MetricDefinition('pool.saturation', MetricType::UpDownCounter, 'How full', '1'),
+            [new Sample([], 0.5)],
+        ),
+    ]);
+
+    expect($output)->toContain("pool_saturation_ratio 0.5\n");
 });
